@@ -24,7 +24,7 @@ let query = parse(
      ORDER BY total DESC LIMIT 10",
 )?;
 
-for item in &query.return_clause.items {
+for item in &query.result.items {
     println!("{}", item.column_name());
 }
 # Ok::<(), cypher_parser::CypherError>(())
@@ -63,7 +63,9 @@ let output = run_query(&my_graph, "MATCH (n:Class) RETURN n.name", OutputFormat:
 - **Scalar functions** — `toLower`, `toUpper`, `size`, `coalesce`, `labels`.
 - **`RETURN`** — `DISTINCT`, `*` (all bound variables), `AS` aliases, and the aggregates `count`,
   `collect`, `min`, `max`, `sum`, `avg`.
-- **`ORDER BY`**, **`SKIP`**, **`LIMIT`**.
+- **`WITH`** — chain clauses by projecting into new bindings (same features as `RETURN`, including
+  aggregates) with an optional trailing `WHERE`, e.g. `MATCH ... WITH n, count(*) AS c WHERE c > 1`.
+- **`ORDER BY`**, **`SKIP`**, **`LIMIT`** (on both `WITH` and `RETURN`).
 
 Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) are intentionally unsupported.
 

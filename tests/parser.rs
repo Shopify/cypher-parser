@@ -1,17 +1,34 @@
-use cypher_parser::ast::{AggFn, CmpOp, Direction, Expr, Literal};
+use cypher_parser::ast::{
+    AggFn, Clause, CmpOp, Direction, Expr, Literal, MatchClause, PathPattern, Query,
+};
 use cypher_parser::parse;
+
+fn first_match(query: &Query) -> &MatchClause {
+    match query.clauses.first() {
+        Some(Clause::Match(m)) => m,
+        _ => panic!("expected the first clause to be MATCH"),
+    }
+}
+
+fn patterns(query: &Query) -> &[PathPattern] {
+    &first_match(query).patterns
+}
+
+fn where_clause(query: &Query) -> Option<Expr> {
+    first_match(query).where_clause.clone()
+}
 
 #[test]
 fn parses_basic_match_return() {
     let query = parse("MATCH (c:Class) RETURN c.name").unwrap();
-    assert_eq!(query.patterns.len(), 1);
-    let start = &query.patterns[0].start;
+    assert_eq!(patterns(&query).len(), 1);
+    let start = &patterns(&query)[0].start;
     assert_eq!(start.var.as_deref(), Some("c"));
     assert_eq!(start.labels, vec!["Class".to_string()]);
-    assert!(query.patterns[0].rest.is_empty());
-    assert_eq!(query.return_clause.items.len(), 1);
+    assert!(patterns(&query)[0].rest.is_empty());
+    assert_eq!(query.result.items.len(), 1);
     assert_eq!(
-        query.return_clause.items[0].expr,
+        query.result.items[0].expr,
         Expr::Property("c".into(), "name".into())
     );
 }
@@ -20,7 +37,7 @@ fn parses_basic_match_return() {
 fn parses_label_disjunction() {
     let query = parse("MATCH (n:Class|Module) RETURN n").unwrap();
     assert_eq!(
-        query.patterns[0].start.labels,
+        patterns(&query)[0].start.labels,
         vec!["Class".to_string(), "Module".to_string()]
     );
 }
@@ -28,7 +45,7 @@ fn parses_label_disjunction() {
 #[test]
 fn parses_inline_properties() {
     let query = parse("MATCH (c:Class {name: 'Foo'}) RETURN c").unwrap();
-    let props = &query.patterns[0].start.props;
+    let props = &patterns(&query)[0].start.props;
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].0, "name");
     assert_eq!(props[0].1, Literal::Str("Foo".into()));
@@ -38,38 +55,38 @@ fn parses_inline_properties() {
 fn parses_relationship_directions() {
     let outgoing = parse("MATCH (a)-[:INHERITS]->(b) RETURN a").unwrap();
     assert_eq!(
-        outgoing.patterns[0].rest[0].0.direction,
+        patterns(&outgoing)[0].rest[0].0.direction,
         Direction::Outgoing
     );
     assert_eq!(
-        outgoing.patterns[0].rest[0].0.types,
+        patterns(&outgoing)[0].rest[0].0.types,
         vec!["INHERITS".to_string()]
     );
 
     let incoming = parse("MATCH (a)<-[:INHERITS]-(b) RETURN a").unwrap();
     assert_eq!(
-        incoming.patterns[0].rest[0].0.direction,
+        patterns(&incoming)[0].rest[0].0.direction,
         Direction::Incoming
     );
 
     let both = parse("MATCH (a)-[:INHERITS]-(b) RETURN a").unwrap();
-    assert_eq!(both.patterns[0].rest[0].0.direction, Direction::Both);
+    assert_eq!(patterns(&both)[0].rest[0].0.direction, Direction::Both);
 }
 
 #[test]
 fn parses_variable_length() {
     let query = parse("MATCH (a)-[:INHERITS*2..5]->(b) RETURN a").unwrap();
-    let length = query.patterns[0].rest[0].0.length.unwrap();
+    let length = patterns(&query)[0].rest[0].0.length.unwrap();
     assert_eq!(length.min, 2);
     assert_eq!(length.max, Some(5));
 
     let unbounded = parse("MATCH (a)-[:OWNS*]->(b) RETURN a").unwrap();
-    let length = unbounded.patterns[0].rest[0].0.length.unwrap();
+    let length = patterns(&unbounded)[0].rest[0].0.length.unwrap();
     assert_eq!(length.min, 1);
     assert_eq!(length.max, None);
 
     let exact = parse("MATCH (a)-[:OWNS*3]->(b) RETURN a").unwrap();
-    let length = exact.patterns[0].rest[0].0.length.unwrap();
+    let length = patterns(&exact)[0].rest[0].0.length.unwrap();
     assert_eq!(length.min, 3);
     assert_eq!(length.max, Some(3));
 }
@@ -77,9 +94,9 @@ fn parses_variable_length() {
 #[test]
 fn parses_aggregation_and_alias() {
     let query = parse("MATCH (c:Class) RETURN c.name, count(*) AS total").unwrap();
-    assert_eq!(query.return_clause.items[1].alias.as_deref(), Some("total"));
+    assert_eq!(query.result.items[1].alias.as_deref(), Some("total"));
     assert_eq!(
-        query.return_clause.items[1].expr,
+        query.result.items[1].expr,
         Expr::Aggregate {
             func: AggFn::Count,
             arg: None,
@@ -90,21 +107,23 @@ fn parses_aggregation_and_alias() {
 
 #[test]
 fn parses_where_and_order_limit() {
-    let query =
-        parse("MATCH (c:Class) WHERE c.name CONTAINS 'Service' RETURN c.name ORDER BY c.name DESC LIMIT 5").unwrap();
-    let Some(Expr::Compare(_, op, _)) = query.where_clause else {
+    let query = parse(
+        "MATCH (c:Class) WHERE c.name CONTAINS 'Service' RETURN c.name ORDER BY c.name DESC LIMIT 5",
+    )
+    .unwrap();
+    let Some(Expr::Compare(_, op, _)) = where_clause(&query) else {
         panic!("expected comparison");
     };
     assert_eq!(op, CmpOp::Contains);
-    assert_eq!(query.order_by.len(), 1);
-    assert!(query.order_by[0].descending);
-    assert_eq!(query.limit, Some(5));
+    assert_eq!(query.result.order_by.len(), 1);
+    assert!(query.result.order_by[0].descending);
+    assert_eq!(query.result.limit, Some(5));
 }
 
 #[test]
 fn parses_in_with_list_literal() {
     let query = parse("MATCH (c:Class) WHERE c.name IN ['Dog', 'Cat'] RETURN c").unwrap();
-    let Some(Expr::Compare(left, op, right)) = query.where_clause else {
+    let Some(Expr::Compare(left, op, right)) = where_clause(&query) else {
         panic!("expected comparison");
     };
     assert_eq!(*left, Expr::Property("c".into(), "name".into()));
@@ -119,7 +138,7 @@ fn parses_in_with_list_literal() {
 
     // Empty list literal is valid.
     let empty = parse("MATCH (c) WHERE c.name IN [] RETURN c").unwrap();
-    let Some(Expr::Compare(_, _, right)) = empty.where_clause else {
+    let Some(Expr::Compare(_, _, right)) = where_clause(&empty) else {
         panic!("expected comparison");
     };
     assert_eq!(*right, Expr::List(vec![]));
@@ -129,7 +148,7 @@ fn parses_in_with_list_literal() {
 fn parses_is_null() {
     let not_null = parse("MATCH (c) WHERE c.line IS NOT NULL RETURN c").unwrap();
     assert_eq!(
-        not_null.where_clause,
+        where_clause(&not_null),
         Some(Expr::IsNull(
             Box::new(Expr::Property("c".into(), "line".into())),
             true,
@@ -138,7 +157,7 @@ fn parses_is_null() {
 
     let is_null = parse("MATCH (c) WHERE c.missing IS NULL RETURN c").unwrap();
     assert_eq!(
-        is_null.where_clause,
+        where_clause(&is_null),
         Some(Expr::IsNull(
             Box::new(Expr::Property("c".into(), "missing".into())),
             false,
@@ -149,19 +168,19 @@ fn parses_is_null() {
 #[test]
 fn parses_return_star() {
     let query = parse("MATCH (c)-[:INHERITS]->(p) RETURN *").unwrap();
-    assert!(query.return_clause.star);
-    assert!(query.return_clause.items.is_empty());
+    assert!(query.result.star);
+    assert!(query.result.items.is_empty());
 
     let distinct = parse("MATCH (c) RETURN DISTINCT *").unwrap();
-    assert!(distinct.return_clause.star);
-    assert!(distinct.return_clause.distinct);
+    assert!(distinct.result.star);
+    assert!(distinct.result.distinct);
 }
 
 #[test]
 fn parses_function_calls() {
     let query =
         parse("MATCH (c) WHERE toLower(c.name) CONTAINS 'service' RETURN size(c.name)").unwrap();
-    let Some(Expr::Compare(left, CmpOp::Contains, _)) = query.where_clause else {
+    let Some(Expr::Compare(left, CmpOp::Contains, _)) = where_clause(&query) else {
         panic!("expected comparison");
     };
     assert_eq!(
@@ -172,7 +191,7 @@ fn parses_function_calls() {
         }
     );
     assert_eq!(
-        query.return_clause.items[0].expr,
+        query.result.items[0].expr,
         Expr::Function {
             name: "size".into(),
             args: vec![Expr::Property("c".into(), "name".into())],
@@ -180,11 +199,30 @@ fn parses_function_calls() {
     );
 
     let coalesce = parse("MATCH (c) RETURN coalesce(c.nick, c.name, 'unknown')").unwrap();
-    let Expr::Function { name, args } = &coalesce.return_clause.items[0].expr else {
+    let Expr::Function { name, args } = &coalesce.result.items[0].expr else {
         panic!("expected function");
     };
     assert_eq!(name, "coalesce");
     assert_eq!(args.len(), 3);
+}
+
+#[test]
+fn parses_with_clause() {
+    let query =
+        parse("MATCH (c:Class) WITH c.name AS n, count(*) AS total WHERE total > 1 RETURN n")
+            .unwrap();
+    assert_eq!(query.clauses.len(), 2);
+
+    let Some(Clause::With(with)) = query.clauses.get(1) else {
+        panic!("expected the second clause to be WITH");
+    };
+    assert_eq!(with.projection.items.len(), 2);
+    assert_eq!(with.projection.items[0].alias.as_deref(), Some("n"));
+    assert_eq!(with.projection.items[1].alias.as_deref(), Some("total"));
+    assert!(with.where_clause.is_some());
+
+    assert_eq!(query.result.items.len(), 1);
+    assert_eq!(query.result.items[0].expr, Expr::Var("n".into()));
 }
 
 #[test]

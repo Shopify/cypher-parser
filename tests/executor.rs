@@ -386,6 +386,55 @@ fn distinct_keeps_distinct_nodes_sharing_a_name() {
 }
 
 #[test]
+fn with_post_aggregation_filter() {
+    let graph = fixture();
+    // Animal is inherited by both Dog and Cat (subs = 2); no other class has > 1 subclass.
+    let parsed = parse(
+        "MATCH (c:Class)-[:INHERITS]->(p:Class) WITH p, count(c) AS subs WHERE subs > 1 RETURN p.name",
+    )
+    .unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], CypherValue::Str("Animal".into()));
+}
+
+#[test]
+fn with_chains_node_bindings() {
+    let graph = fixture();
+    // `WITH c` keeps c bound as a node, so the next MATCH can expand from it.
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class {name: 'Dog'}) WITH c MATCH (c)-[:INHERITS]->(p) RETURN p.name",
+            0
+        ),
+        vec!["Animal".to_string()]
+    );
+}
+
+#[test]
+fn with_distinct_dedupes_nodes() {
+    let graph = fixture();
+    // Dog and Cat both inherit Animal; DISTINCT collapses the duplicate Animal binding.
+    let parsed =
+        parse("MATCH (c:Class)-[:INHERITS]->(p:Class) WITH DISTINCT p RETURN p.name").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], CypherValue::Str("Animal".into()));
+}
+
+#[test]
+fn with_order_skip_limit_in_pipeline() {
+    let graph = fixture();
+    // Classes sorted by name: Animal, Cat, Dog. SKIP 1, LIMIT 1 -> Cat.
+    let parsed =
+        parse("MATCH (c:Class) WITH c.name AS n ORDER BY n SKIP 1 LIMIT 1 RETURN n").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], CypherValue::Str("Cat".into()));
+}
+
+#[test]
 fn run_query_json() {
     let graph = fixture();
     let output = run_query(

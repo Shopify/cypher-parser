@@ -23,7 +23,10 @@
 //! - Scalar functions `toLower`, `toUpper`, `size`, `coalesce`, `labels`.
 //! - `RETURN` with `DISTINCT`, `*` (all bound variables), `AS` aliases, and the aggregates `count`,
 //!   `collect`, `min`, `max`, `sum`, `avg`.
-//! - `ORDER BY`, `SKIP`, `LIMIT`.
+//! - `WITH` to chain clauses: project (with the same features as `RETURN`, including aggregates)
+//!   into a new set of bindings, with an optional trailing `WHERE` — enabling post-aggregation
+//!   filtering such as `MATCH ... WITH n, count(*) AS c WHERE c > 1 RETURN ...`.
+//! - `ORDER BY`, `SKIP`, `LIMIT` (on both `WITH` and `RETURN`).
 //!
 //! Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, …) are intentionally not supported.
 //!
@@ -33,8 +36,8 @@
 //! use cypher_parser::parse;
 //!
 //! let query = parse("MATCH (c:Class)-[:INHERITS*1..]->(p:Class {name: 'Base'}) RETURN c.name").unwrap();
-//! assert_eq!(query.patterns.len(), 1);
-//! assert_eq!(query.return_clause.items.len(), 1);
+//! assert_eq!(query.clauses.len(), 1);
+//! assert_eq!(query.result.items.len(), 1);
 //! ```
 //!
 //! To execute queries, implement [`GraphProvider`] for your data and call [`run_query`] or

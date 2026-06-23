@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::ast::{
-    AggFn, CmpOp, Direction, Expr, Literal, NodePattern, OrderItem, PathPattern, Query, ReturnItem,
+    AggFn, Clause, CmpOp, Direction, Expr, Literal, MatchClause, NodePattern, OrderItem,
+    PathPattern, Projection, Query, ReturnItem, WithClause,
 };
 use crate::error::CypherError;
 use crate::provider::GraphProvider;
@@ -15,18 +16,46 @@ pub struct ResultSet {
     pub rows: Vec<Vec<CypherValue>>,
 }
 
-/// A single binding row: maps pattern variable names to graph nodes.
-type Row<N> = HashMap<String, N>;
+/// A bound variable: either a graph node (which keeps its identity for pattern chaining) or a
+/// scalar/computed value (produced by a `WITH` projection).
+enum Binding<N> {
+    Node(N),
+    Value(CypherValue),
+}
+
+impl<N: Copy> Clone for Binding<N> {
+    fn clone(&self) -> Self {
+        match self {
+            Binding::Node(n) => Binding::Node(*n),
+            Binding::Value(v) => Binding::Value(v.clone()),
+        }
+    }
+}
+
+/// A single binding row: maps variable names to their bindings.
+type Row<N> = HashMap<String, Binding<N>>;
 
 /// A binding row paired with the node most recently matched in the path being expanded.
 type Working<N> = Vec<(Row<N>, N)>;
+
+/// A projected row: the new bindings carried to the next clause, plus the aligned output values.
+struct Projected<N> {
+    bindings: Row<N>,
+    values: Vec<CypherValue>,
+}
+
+/// Output column names paired with the binding rows a `WITH` clause carries forward.
+type WithOutput<N> = (Vec<String>, Vec<Row<N>>);
+
+/// Output column names paired with the projected rows of a projection.
+type ProjectedRows<N> = (Vec<String>, Vec<Projected<N>>);
 
 /// Executes a parsed query against any [`GraphProvider`].
 ///
 /// # Errors
 ///
 /// Returns a [`CypherError::Execution`] for unknown relationship types, aggregates used in `WHERE`,
-/// or `ORDER BY` expressions that cannot be resolved under aggregation.
+/// or `ORDER BY` expressions that cannot be resolved against the projection.
 pub fn execute<G: GraphProvider>(graph: &G, query: &Query) -> Result<ResultSet, CypherError> {
     let mut executor = Executor {
         graph,
@@ -43,21 +72,78 @@ struct Executor<'a, G: GraphProvider> {
 impl<G: GraphProvider> Executor<'_, G> {
     fn run(&mut self, query: &Query) -> Result<ResultSet, CypherError> {
         let mut rows: Vec<Row<G::NodeId>> = vec![Row::new()];
-        for pattern in &query.patterns {
-            rows = self.eval_pattern(rows, pattern)?;
-        }
+        let mut scope: Vec<String> = Vec::new();
 
-        if let Some(predicate) = &query.where_clause {
-            let mut filtered = Vec::with_capacity(rows.len());
-            for row in rows {
-                if self.eval_expr(&row, predicate)?.is_truthy() {
-                    filtered.push(row);
+        for clause in &query.clauses {
+            match clause {
+                Clause::Match(m) => rows = self.run_match(rows, m, &mut scope)?,
+                Clause::With(w) => {
+                    let (columns, rows_after) = self.run_with(&rows, w, &scope)?;
+                    rows = rows_after;
+                    scope = columns;
                 }
             }
-            rows = filtered;
         }
 
-        self.project(query, &rows)
+        // Terminal RETURN.
+        let (columns, projected) = self.project_rows(&query.result, &rows, &scope)?;
+        let projected = finalize(&query.result, &columns, projected)?;
+        Ok(ResultSet {
+            columns,
+            rows: projected.into_iter().map(|p| p.values).collect(),
+        })
+    }
+
+    fn run_match(
+        &mut self,
+        mut rows: Vec<Row<G::NodeId>>,
+        clause: &MatchClause,
+        scope: &mut Vec<String>,
+    ) -> Result<Vec<Row<G::NodeId>>, CypherError> {
+        for pattern in &clause.patterns {
+            rows = self.eval_pattern(rows, pattern)?;
+            add_pattern_vars(scope, pattern);
+        }
+        if let Some(predicate) = &clause.where_clause {
+            rows = self.filter_rows(rows, predicate)?;
+        }
+        Ok(rows)
+    }
+
+    fn run_with(
+        &self,
+        rows: &[Row<G::NodeId>],
+        clause: &WithClause,
+        scope: &[String],
+    ) -> Result<WithOutput<G::NodeId>, CypherError> {
+        let (columns, projected) = self.project_rows(&clause.projection, rows, scope)?;
+        let projected = finalize(&clause.projection, &columns, projected)?;
+
+        // `WITH ... WHERE` filters the projected bindings.
+        let mut new_rows = Vec::with_capacity(projected.len());
+        for p in projected {
+            if let Some(predicate) = &clause.where_clause
+                && !self.eval_expr(&p.bindings, predicate)?.is_truthy()
+            {
+                continue;
+            }
+            new_rows.push(p.bindings);
+        }
+        Ok((columns, new_rows))
+    }
+
+    fn filter_rows(
+        &self,
+        rows: Vec<Row<G::NodeId>>,
+        predicate: &Expr,
+    ) -> Result<Vec<Row<G::NodeId>>, CypherError> {
+        let mut filtered = Vec::with_capacity(rows.len());
+        for row in rows {
+            if self.eval_expr(&row, predicate)?.is_truthy() {
+                filtered.push(row);
+            }
+        }
+        Ok(filtered)
     }
 
     // ---- Pattern matching ------------------------------------------------
@@ -73,7 +159,7 @@ impl<G: GraphProvider> Executor<'_, G> {
             for node in self.candidates_for_node(&row, &pattern.start) {
                 let mut new_row = row.clone();
                 if let Some(var) = &pattern.start.var {
-                    new_row.insert(var.clone(), node);
+                    new_row.insert(var.clone(), Binding::Node(node));
                 }
                 working.push((new_row, node));
             }
@@ -88,12 +174,11 @@ impl<G: GraphProvider> Executor<'_, G> {
 
     fn candidates_for_node(&self, row: &Row<G::NodeId>, pattern: &NodePattern) -> Vec<G::NodeId> {
         if let Some(var) = &pattern.var
-            && let Some(existing) = row.get(var)
+            && let Some(binding) = row.get(var)
         {
-            return if self.node_matches(*existing, pattern) {
-                vec![*existing]
-            } else {
-                Vec::new()
+            return match binding {
+                Binding::Node(existing) if self.node_matches(*existing, pattern) => vec![*existing],
+                _ => Vec::new(),
             };
         }
 
@@ -120,15 +205,18 @@ impl<G: GraphProvider> Executor<'_, G> {
                 if !self.node_matches(target, node) {
                     continue;
                 }
+                // If the target variable is already bound, it must be the same node.
                 if let Some(var) = &node.var
                     && let Some(existing) = row.get(var)
-                    && *existing != target
                 {
-                    continue;
+                    match existing {
+                        Binding::Node(n) if *n == target => {}
+                        _ => continue,
+                    }
                 }
                 let mut new_row = row.clone();
                 if let Some(var) = &node.var {
-                    new_row.insert(var.clone(), target);
+                    new_row.insert(var.clone(), Binding::Node(target));
                 }
                 next.push((new_row, target));
             }
@@ -285,12 +373,15 @@ impl<G: GraphProvider> Executor<'_, G> {
     fn eval_expr(&self, row: &Row<G::NodeId>, expr: &Expr) -> Result<CypherValue, CypherError> {
         match expr {
             Expr::Literal(literal) => Ok(literal_to_value(literal)),
-            Expr::Var(name) => Ok(row
-                .get(name)
-                .map_or(CypherValue::Null, |node| self.node_value(*node))),
-            Expr::Property(var, prop) => Ok(row
-                .get(var)
-                .map_or(CypherValue::Null, |node| self.graph.property(*node, prop))),
+            Expr::Var(name) => Ok(match row.get(name) {
+                Some(Binding::Node(node)) => self.node_value(*node),
+                Some(Binding::Value(value)) => value.clone(),
+                None => CypherValue::Null,
+            }),
+            Expr::Property(var, prop) => Ok(match row.get(var) {
+                Some(Binding::Node(node)) => self.graph.property(*node, prop),
+                _ => CypherValue::Null,
+            }),
             Expr::Not(inner) => Ok(CypherValue::Bool(!self.eval_expr(row, inner)?.is_truthy())),
             Expr::And(a, b) => Ok(CypherValue::Bool(
                 self.eval_expr(row, a)?.is_truthy() && self.eval_expr(row, b)?.is_truthy(),
@@ -316,7 +407,7 @@ impl<G: GraphProvider> Executor<'_, G> {
             }
             Expr::Function { name, args } => self.eval_function(row, name, args),
             Expr::Aggregate { .. } => Err(CypherError::execution(
-                "aggregate functions are only allowed in RETURN",
+                "aggregate functions are only allowed in WITH or RETURN projections",
             )),
         }
     }
@@ -400,98 +491,121 @@ impl<G: GraphProvider> Executor<'_, G> {
         }
     }
 
+    fn binding_value(&self, binding: &Binding<G::NodeId>) -> CypherValue {
+        match binding {
+            Binding::Node(node) => self.node_value(*node),
+            Binding::Value(value) => value.clone(),
+        }
+    }
+
     // ---- Projection ------------------------------------------------------
 
-    fn project(&self, query: &Query, rows: &[Row<G::NodeId>]) -> Result<ResultSet, CypherError> {
-        if query.return_clause.star {
-            return self.project_star(query, rows);
+    /// Projects the current rows through a `WITH` or `RETURN` projection, returning the output
+    /// column names and one [`Projected`] per output row (bindings + aligned display values).
+    /// Does not apply DISTINCT / ORDER BY / SKIP / LIMIT — see [`finalize`].
+    fn project_rows(
+        &self,
+        projection: &Projection,
+        rows: &[Row<G::NodeId>],
+        scope: &[String],
+    ) -> Result<ProjectedRows<G::NodeId>, CypherError> {
+        if projection.star {
+            return self.project_star(rows, scope);
         }
 
-        let items = &query.return_clause.items;
-        let columns: Vec<String> = items.iter().map(ReturnItem::column_name).collect();
+        let items = &projection.items;
+        let columns = projection.column_names();
 
-        let has_aggregate = items.iter().any(|item| item.expr.contains_aggregate());
-
-        let mut values = if has_aggregate {
-            self.project_aggregated(query, rows)?
+        let projected = if projection.has_aggregate() {
+            self.project_aggregated(items, &columns, rows)?
         } else {
-            self.project_simple(query, rows)?
+            self.project_simple(items, &columns, rows)?
         };
 
-        if query.return_clause.distinct {
-            dedupe(&mut values);
-        }
-
-        apply_order_skip_limit(query, &mut values, &columns)?;
-
-        Ok(ResultSet {
-            columns,
-            rows: values,
-        })
+        Ok((columns, projected))
     }
 
     fn project_star(
         &self,
-        query: &Query,
         rows: &[Row<G::NodeId>],
-    ) -> Result<ResultSet, CypherError> {
-        let columns = star_variables(query);
-        if columns.is_empty() {
+        scope: &[String],
+    ) -> Result<ProjectedRows<G::NodeId>, CypherError> {
+        if scope.is_empty() {
             return Err(CypherError::execution(
-                "RETURN * requires at least one bound variable in the MATCH pattern",
+                "`*` requires at least one variable in scope",
             ));
         }
 
-        let mut values: Vec<Vec<CypherValue>> = Vec::with_capacity(rows.len());
+        let columns = scope.to_vec();
+        let mut projected = Vec::with_capacity(rows.len());
         for row in rows {
-            values.push(
-                columns
-                    .iter()
-                    .map(|var| {
-                        row.get(var)
-                            .map_or(CypherValue::Null, |node| self.node_value(*node))
-                    })
-                    .collect(),
-            );
+            let mut bindings = Row::new();
+            let mut values = Vec::with_capacity(columns.len());
+            for name in &columns {
+                let binding = row
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(Binding::Value(CypherValue::Null));
+                values.push(self.binding_value(&binding));
+                bindings.insert(name.clone(), binding);
+            }
+            projected.push(Projected { bindings, values });
         }
-
-        if query.return_clause.distinct {
-            dedupe(&mut values);
-        }
-
-        apply_order_skip_limit(query, &mut values, &columns)?;
-
-        Ok(ResultSet {
-            columns,
-            rows: values,
-        })
+        Ok((columns, projected))
     }
 
     fn project_simple(
         &self,
-        query: &Query,
+        items: &[ReturnItem],
+        columns: &[String],
         rows: &[Row<G::NodeId>],
-    ) -> Result<Vec<Vec<CypherValue>>, CypherError> {
-        let items = &query.return_clause.items;
+    ) -> Result<Vec<Projected<G::NodeId>>, CypherError> {
         let mut output = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut values = Vec::with_capacity(items.len());
-            for item in items {
-                values.push(self.eval_expr(row, &item.expr)?);
-            }
-            output.push(values);
+            output.push(self.project_one(items, columns, row)?);
         }
         Ok(output)
     }
 
+    /// Projects a single input row, preserving node identity for bare-variable items so the
+    /// projected variable can still be used as a node by later pattern matching.
+    fn project_one(
+        &self,
+        items: &[ReturnItem],
+        columns: &[String],
+        row: &Row<G::NodeId>,
+    ) -> Result<Projected<G::NodeId>, CypherError> {
+        let mut bindings = Row::new();
+        let mut values = Vec::with_capacity(items.len());
+        for (column, item) in columns.iter().zip(items) {
+            let binding = self.project_binding(row, item)?;
+            values.push(self.binding_value(&binding));
+            bindings.insert(column.clone(), binding);
+        }
+        Ok(Projected { bindings, values })
+    }
+
+    fn project_binding(
+        &self,
+        row: &Row<G::NodeId>,
+        item: &ReturnItem,
+    ) -> Result<Binding<G::NodeId>, CypherError> {
+        if let Expr::Var(name) = &item.expr {
+            return Ok(row
+                .get(name)
+                .cloned()
+                .unwrap_or(Binding::Value(CypherValue::Null)));
+        }
+        Ok(Binding::Value(self.eval_expr(row, &item.expr)?))
+    }
+
     fn project_aggregated(
         &self,
-        query: &Query,
+        items: &[ReturnItem],
+        columns: &[String],
         rows: &[Row<G::NodeId>],
-    ) -> Result<Vec<Vec<CypherValue>>, CypherError> {
-        let items = &query.return_clause.items;
-
-        // Group rows by the values of the non-aggregate (grouping) return items.
+    ) -> Result<Vec<Projected<G::NodeId>>, CypherError> {
+        // Group rows by the values of the non-aggregate (grouping) items.
         let mut group_order: Vec<Vec<CypherValue>> = Vec::new();
         let mut groups: HashMap<Vec<CypherValue>, Vec<usize>> = HashMap::new();
 
@@ -523,17 +637,23 @@ impl<G: GraphProvider> Executor<'_, G> {
             let row_indices = &groups[&key];
             let group_rows: Vec<&Row<G::NodeId>> =
                 row_indices.iter().map(|index| &rows[*index]).collect();
+            let representative = group_rows.first().copied();
 
+            let mut bindings = Row::new();
             let mut values = Vec::with_capacity(items.len());
-            let mut key_iter = key.iter();
-            for item in items {
-                if item.expr.contains_aggregate() {
-                    values.push(self.eval_aggregate(&item.expr, &group_rows)?);
+            for (column, item) in columns.iter().zip(items) {
+                let binding = if item.expr.contains_aggregate() {
+                    Binding::Value(self.eval_aggregate(&item.expr, &group_rows)?)
+                } else if let Some(row) = representative {
+                    // Preserve the grouping item's binding (e.g. node identity).
+                    self.project_binding(row, item)?
                 } else {
-                    values.push(key_iter.next().cloned().unwrap_or(CypherValue::Null));
-                }
+                    Binding::Value(CypherValue::Null)
+                };
+                values.push(self.binding_value(&binding));
+                bindings.insert(column.clone(), binding);
             }
-            output.push(values);
+            output.push(Projected { bindings, values });
         }
 
         Ok(output)
@@ -602,26 +722,25 @@ impl<G: GraphProvider> Executor<'_, G> {
     }
 }
 
-fn apply_order_skip_limit(
-    query: &Query,
-    values: &mut Vec<Vec<CypherValue>>,
+/// Applies DISTINCT, ORDER BY, SKIP, and LIMIT to a set of projected rows.
+fn finalize<N>(
+    projection: &Projection,
     columns: &[String],
-) -> Result<(), CypherError> {
-    // ORDER BY operates on the projected value rows: each ORDER BY expression must resolve to
-    // a RETURN column (by identical expression or by naming a column/alias).
-    if !query.order_by.is_empty() {
-        let mut keys: Vec<usize> = Vec::with_capacity(query.order_by.len());
-        for item in &query.order_by {
-            keys.push(resolve_order_column(
-                item,
-                &query.return_clause.items,
-                columns,
-            )?);
+    mut projected: Vec<Projected<N>>,
+) -> Result<Vec<Projected<N>>, CypherError> {
+    if projection.distinct {
+        dedupe_projected(&mut projected);
+    }
+
+    if !projection.order_by.is_empty() {
+        let mut keys: Vec<usize> = Vec::with_capacity(projection.order_by.len());
+        for item in &projection.order_by {
+            keys.push(resolve_order_column(item, &projection.items, columns)?);
         }
 
-        values.sort_by(|a, b| {
-            for (key_index, order_item) in keys.iter().zip(&query.order_by) {
-                let ordering = a[*key_index].total_cmp(&b[*key_index]);
+        projected.sort_by(|a, b| {
+            for (key_index, order_item) in keys.iter().zip(&projection.order_by) {
+                let ordering = a.values[*key_index].total_cmp(&b.values[*key_index]);
                 let ordering = if order_item.descending {
                     ordering.reverse()
                 } else {
@@ -635,21 +754,21 @@ fn apply_order_skip_limit(
         });
     }
 
-    if let Some(skip) = query.skip {
-        if skip >= values.len() {
-            values.clear();
+    if let Some(skip) = projection.skip {
+        if skip >= projected.len() {
+            projected.clear();
         } else {
-            values.drain(0..skip);
+            projected.drain(0..skip);
         }
     }
 
-    if let Some(limit) = query.limit
-        && values.len() > limit
+    if let Some(limit) = projection.limit
+        && projected.len() > limit
     {
-        values.truncate(limit);
+        projected.truncate(limit);
     }
 
-    Ok(())
+    Ok(projected)
 }
 
 fn resolve_order_column(
@@ -657,12 +776,12 @@ fn resolve_order_column(
     items: &[ReturnItem],
     columns: &[String],
 ) -> Result<usize, CypherError> {
-    // Match by identical return expression first.
+    // Match by identical projection expression first.
     if let Some(index) = items.iter().position(|item| item.expr == order_item.expr) {
         return Ok(index);
     }
 
-    // Otherwise, a bare variable in ORDER BY may name a return column or alias.
+    // Otherwise, a bare variable in ORDER BY may name a projected column or alias.
     if let Expr::Var(name) = &order_item.expr
         && let Some(index) = columns.iter().position(|column| column == name)
     {
@@ -670,9 +789,24 @@ fn resolve_order_column(
     }
 
     Err(CypherError::execution(format!(
-        "ORDER BY expression `{}` must also appear in RETURN",
+        "ORDER BY expression `{}` must also appear in the projection",
         order_item.expr.display_name()
     )))
+}
+
+/// Adds the node variables introduced by a pattern to the scope, in declaration order.
+fn add_pattern_vars(scope: &mut Vec<String>, pattern: &PathPattern) {
+    let mut push = |var: &Option<String>| {
+        if let Some(name) = var
+            && !scope.contains(name)
+        {
+            scope.push(name.clone());
+        }
+    };
+    push(&pattern.start.var);
+    for (_, node) in &pattern.rest {
+        push(&node.var);
+    }
 }
 
 /// Returns the single argument of a scalar function, or an error if the arity is not exactly one.
@@ -683,28 +817,6 @@ fn single_arg<'a>(name: &str, args: &'a [Expr]) -> Result<&'a Expr, CypherError>
             "`{name}` expects exactly one argument"
         ))),
     }
-}
-
-/// Collects the bound (node) variable names from a query's patterns in declaration order,
-/// deduplicated. These are the columns produced by `RETURN *`.
-fn star_variables(query: &Query) -> Vec<String> {
-    let mut vars = Vec::new();
-    let mut seen = HashSet::new();
-    for pattern in &query.patterns {
-        if let Some(name) = &pattern.start.var
-            && seen.insert(name.clone())
-        {
-            vars.push(name.clone());
-        }
-        for (_, node) in &pattern.rest {
-            if let Some(name) = &node.var
-                && seen.insert(name.clone())
-            {
-                vars.push(name.clone());
-            }
-        }
-    }
-    vars
 }
 
 fn literal_to_value(literal: &Literal) -> CypherValue {
@@ -771,13 +883,13 @@ fn string_op(left: &CypherValue, right: &CypherValue, op: impl Fn(&str, &str) ->
     }
 }
 
-fn dedupe(output: &mut Vec<Vec<CypherValue>>) {
+fn dedupe_projected<N>(output: &mut Vec<Projected<N>>) {
     let mut seen: Vec<Vec<CypherValue>> = Vec::new();
-    output.retain(|values| {
-        if seen.iter().any(|existing| existing == values) {
+    output.retain(|projected| {
+        if seen.iter().any(|existing| existing == &projected.values) {
             false
         } else {
-            seen.push(values.clone());
+            seen.push(projected.values.clone());
             true
         }
     });

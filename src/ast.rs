@@ -1,15 +1,62 @@
 //! Abstract syntax tree for the supported subset of Cypher.
 
-/// A complete parsed query.
+/// A complete parsed query: a sequence of reading clauses (`MATCH` / `WITH`) terminated by a
+/// `RETURN` projection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
-    /// One or more comma-separated path patterns from the `MATCH` clause.
+    /// The `MATCH` / `WITH` clauses, in order. Always at least one.
+    pub clauses: Vec<Clause>,
+    /// The terminal `RETURN` projection.
+    pub result: Projection,
+}
+
+/// A reading clause in the query pipeline.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Clause {
+    Match(MatchClause),
+    With(WithClause),
+}
+
+/// A `MATCH` clause: comma-separated path patterns with an optional `WHERE` filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchClause {
     pub patterns: Vec<PathPattern>,
     pub where_clause: Option<Expr>,
-    pub return_clause: Return,
+}
+
+/// A `WITH` clause: a projection that rebinds variables for the rest of the pipeline, with an
+/// optional trailing `WHERE` filter applied after projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub projection: Projection,
+    pub where_clause: Option<Expr>,
+}
+
+/// A projection shared by `WITH` and `RETURN`: the items (or `*`), with `DISTINCT` and the
+/// `ORDER BY` / `SKIP` / `LIMIT` modifiers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Projection {
+    pub distinct: bool,
+    /// `*` — project every variable in scope. When set, `items` is empty.
+    pub star: bool,
+    pub items: Vec<ReturnItem>,
     pub order_by: Vec<OrderItem>,
     pub skip: Option<usize>,
     pub limit: Option<usize>,
+}
+
+impl Projection {
+    /// The output column names, in order.
+    #[must_use]
+    pub fn column_names(&self) -> Vec<String> {
+        self.items.iter().map(ReturnItem::column_name).collect()
+    }
+
+    /// Whether any projected item contains an aggregate function call.
+    #[must_use]
+    pub fn has_aggregate(&self) -> bool {
+        self.items.iter().any(|item| item.expr.contains_aggregate())
+    }
 }
 
 /// A path pattern: a starting node followed by zero or more relationship/node hops.
@@ -63,14 +110,6 @@ pub enum Literal {
     Int(i64),
     Bool(bool),
     Null,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Return {
-    pub distinct: bool,
-    /// `RETURN *` — project every bound pattern variable. When set, `items` is empty.
-    pub star: bool,
-    pub items: Vec<ReturnItem>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

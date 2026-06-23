@@ -1,6 +1,6 @@
 use crate::ast::{
-    AggFn, CmpOp, Direction, Expr, Literal, NodePattern, OrderItem, PathPattern, Query, RelPattern,
-    Return, ReturnItem, VarLength,
+    AggFn, Clause, CmpOp, Direction, Expr, Literal, MatchClause, NodePattern, OrderItem,
+    PathPattern, Projection, Query, RelPattern, ReturnItem, VarLength, WithClause,
 };
 use crate::error::CypherError;
 use crate::lexer::{Token, TokenKind, tokenize};
@@ -107,43 +107,55 @@ impl Parser {
     }
 
     fn parse_query(&mut self) -> Result<Query, CypherError> {
+        let mut clauses = Vec::new();
+        loop {
+            if self.at_keyword("MATCH") {
+                clauses.push(Clause::Match(self.parse_match_clause()?));
+            } else if self.at_keyword("WITH") {
+                clauses.push(Clause::With(self.parse_with_clause()?));
+            } else {
+                break;
+            }
+        }
+
+        if clauses.is_empty() {
+            return Err(CypherError::syntax(
+                "expected `MATCH`",
+                self.current_position(),
+            ));
+        }
+
+        self.expect_keyword("RETURN")?;
+        let result = self.parse_projection()?;
+
+        Ok(Query { clauses, result })
+    }
+
+    fn parse_match_clause(&mut self) -> Result<MatchClause, CypherError> {
         self.expect_keyword("MATCH")?;
         let patterns = self.parse_patterns()?;
-
         let where_clause = if self.eat_keyword("WHERE") {
             Some(self.parse_expr()?)
         } else {
             None
         };
-
-        self.expect_keyword("RETURN")?;
-        let return_clause = self.parse_return()?;
-
-        let mut order_by = Vec::new();
-        if self.eat_keyword("ORDER") {
-            self.expect_keyword("BY")?;
-            order_by = self.parse_order_by()?;
-        }
-
-        let skip = if self.eat_keyword("SKIP") {
-            Some(self.parse_usize()?)
-        } else {
-            None
-        };
-
-        let limit = if self.eat_keyword("LIMIT") {
-            Some(self.parse_usize()?)
-        } else {
-            None
-        };
-
-        Ok(Query {
+        Ok(MatchClause {
             patterns,
             where_clause,
-            return_clause,
-            order_by,
-            skip,
-            limit,
+        })
+    }
+
+    fn parse_with_clause(&mut self) -> Result<WithClause, CypherError> {
+        self.expect_keyword("WITH")?;
+        let projection = self.parse_projection()?;
+        let where_clause = if self.eat_keyword("WHERE") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(WithClause {
+            projection,
+            where_clause,
         })
     }
 
@@ -348,27 +360,46 @@ impl Parser {
         }
     }
 
-    fn parse_return(&mut self) -> Result<Return, CypherError> {
+    fn parse_projection(&mut self) -> Result<Projection, CypherError> {
         let distinct = self.eat_keyword("DISTINCT");
 
-        if matches!(self.peek_kind(), Some(TokenKind::Star)) {
+        let (star, items) = if matches!(self.peek_kind(), Some(TokenKind::Star)) {
             self.position += 1;
-            return Ok(Return {
-                distinct,
-                star: true,
-                items: Vec::new(),
-            });
+            (true, Vec::new())
+        } else {
+            let mut items = vec![self.parse_return_item()?];
+            while matches!(self.peek_kind(), Some(TokenKind::Comma)) {
+                self.position += 1;
+                items.push(self.parse_return_item()?);
+            }
+            (false, items)
+        };
+
+        let mut order_by = Vec::new();
+        if self.eat_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            order_by = self.parse_order_by()?;
         }
 
-        let mut items = vec![self.parse_return_item()?];
-        while matches!(self.peek_kind(), Some(TokenKind::Comma)) {
-            self.position += 1;
-            items.push(self.parse_return_item()?);
-        }
-        Ok(Return {
+        let skip = if self.eat_keyword("SKIP") {
+            Some(self.parse_usize()?)
+        } else {
+            None
+        };
+
+        let limit = if self.eat_keyword("LIMIT") {
+            Some(self.parse_usize()?)
+        } else {
+            None
+        };
+
+        Ok(Projection {
             distinct,
-            star: false,
+            star,
             items,
+            order_by,
+            skip,
+            limit,
         })
     }
 
