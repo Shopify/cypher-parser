@@ -102,9 +102,97 @@ fn parses_where_and_order_limit() {
 }
 
 #[test]
+fn parses_in_with_list_literal() {
+    let query = parse("MATCH (c:Class) WHERE c.name IN ['Dog', 'Cat'] RETURN c").unwrap();
+    let Some(Expr::Compare(left, op, right)) = query.where_clause else {
+        panic!("expected comparison");
+    };
+    assert_eq!(*left, Expr::Property("c".into(), "name".into()));
+    assert_eq!(op, CmpOp::In);
+    assert_eq!(
+        *right,
+        Expr::List(vec![
+            Expr::Literal(Literal::Str("Dog".into())),
+            Expr::Literal(Literal::Str("Cat".into())),
+        ])
+    );
+
+    // Empty list literal is valid.
+    let empty = parse("MATCH (c) WHERE c.name IN [] RETURN c").unwrap();
+    let Some(Expr::Compare(_, _, right)) = empty.where_clause else {
+        panic!("expected comparison");
+    };
+    assert_eq!(*right, Expr::List(vec![]));
+}
+
+#[test]
+fn parses_is_null() {
+    let not_null = parse("MATCH (c) WHERE c.line IS NOT NULL RETURN c").unwrap();
+    assert_eq!(
+        not_null.where_clause,
+        Some(Expr::IsNull(
+            Box::new(Expr::Property("c".into(), "line".into())),
+            true,
+        ))
+    );
+
+    let is_null = parse("MATCH (c) WHERE c.missing IS NULL RETURN c").unwrap();
+    assert_eq!(
+        is_null.where_clause,
+        Some(Expr::IsNull(
+            Box::new(Expr::Property("c".into(), "missing".into())),
+            false,
+        ))
+    );
+}
+
+#[test]
+fn parses_return_star() {
+    let query = parse("MATCH (c)-[:INHERITS]->(p) RETURN *").unwrap();
+    assert!(query.return_clause.star);
+    assert!(query.return_clause.items.is_empty());
+
+    let distinct = parse("MATCH (c) RETURN DISTINCT *").unwrap();
+    assert!(distinct.return_clause.star);
+    assert!(distinct.return_clause.distinct);
+}
+
+#[test]
+fn parses_function_calls() {
+    let query =
+        parse("MATCH (c) WHERE toLower(c.name) CONTAINS 'service' RETURN size(c.name)").unwrap();
+    let Some(Expr::Compare(left, CmpOp::Contains, _)) = query.where_clause else {
+        panic!("expected comparison");
+    };
+    assert_eq!(
+        *left,
+        Expr::Function {
+            name: "toLower".into(),
+            args: vec![Expr::Property("c".into(), "name".into())],
+        }
+    );
+    assert_eq!(
+        query.return_clause.items[0].expr,
+        Expr::Function {
+            name: "size".into(),
+            args: vec![Expr::Property("c".into(), "name".into())],
+        }
+    );
+
+    let coalesce = parse("MATCH (c) RETURN coalesce(c.nick, c.name, 'unknown')").unwrap();
+    let Expr::Function { name, args } = &coalesce.return_clause.items[0].expr else {
+        panic!("expected function");
+    };
+    assert_eq!(name, "coalesce");
+    assert_eq!(args.len(), 3);
+}
+
+#[test]
 fn rejects_invalid_syntax() {
     assert!(parse("MATCH (c:Class RETURN c").is_err());
     assert!(parse("RETURN c").is_err());
     assert!(parse("MATCH (c) RETURN").is_err());
     assert!(parse("MATCH (a)<-[:INHERITS]->(b) RETURN a").is_err());
+    assert!(parse("MATCH (c) WHERE c.x IS RETURN c").is_err());
+    assert!(parse("MATCH (c) WHERE c.x IN ['a' RETURN c").is_err());
 }

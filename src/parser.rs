@@ -350,12 +350,26 @@ impl Parser {
 
     fn parse_return(&mut self) -> Result<Return, CypherError> {
         let distinct = self.eat_keyword("DISTINCT");
+
+        if matches!(self.peek_kind(), Some(TokenKind::Star)) {
+            self.position += 1;
+            return Ok(Return {
+                distinct,
+                star: true,
+                items: Vec::new(),
+            });
+        }
+
         let mut items = vec![self.parse_return_item()?];
         while matches!(self.peek_kind(), Some(TokenKind::Comma)) {
             self.position += 1;
             items.push(self.parse_return_item()?);
         }
-        Ok(Return { distinct, items })
+        Ok(Return {
+            distinct,
+            star: false,
+            items,
+        })
     }
 
     fn parse_return_item(&mut self) -> Result<ReturnItem, CypherError> {
@@ -422,6 +436,11 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr, CypherError> {
         let left = self.parse_primary()?;
+        if self.eat_keyword("IS") {
+            let negated = self.eat_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            return Ok(Expr::IsNull(Box::new(left), negated));
+        }
         if let Some(op) = self.parse_comparison_op()? {
             let right = self.parse_primary()?;
             Ok(Expr::Compare(Box::new(left), op, Box::new(right)))
@@ -441,6 +460,10 @@ impl Parser {
             Some(TokenKind::Ident(name)) if name.eq_ignore_ascii_case("CONTAINS") => {
                 self.position += 1;
                 return Ok(Some(CmpOp::Contains));
+            }
+            Some(TokenKind::Ident(name)) if name.eq_ignore_ascii_case("IN") => {
+                self.position += 1;
+                return Ok(Some(CmpOp::In));
             }
             Some(TokenKind::Ident(name)) if name.eq_ignore_ascii_case("STARTS") => {
                 self.position += 1;
@@ -466,6 +489,7 @@ impl Parser {
                 self.expect(&TokenKind::RParen, "`)` to close a grouped expression")?;
                 Ok(expr)
             }
+            Some(TokenKind::LBracket) => self.parse_list_literal(),
             Some(TokenKind::Str(_) | TokenKind::Int(_)) => Ok(Expr::Literal(self.parse_literal()?)),
             Some(TokenKind::Ident(name)) => {
                 let name = name.clone();
@@ -475,13 +499,15 @@ impl Parser {
                 {
                     return Ok(Expr::Literal(self.parse_literal()?));
                 }
-                if let Some(func) = aggregate_function(&name)
-                    && matches!(
-                        self.tokens.get(self.position + 1).map(|t| &t.kind),
-                        Some(TokenKind::LParen)
-                    )
-                {
-                    return self.parse_aggregate(func);
+                let followed_by_paren = matches!(
+                    self.tokens.get(self.position + 1).map(|t| &t.kind),
+                    Some(TokenKind::LParen)
+                );
+                if followed_by_paren {
+                    if let Some(func) = aggregate_function(&name) {
+                        return self.parse_aggregate(func);
+                    }
+                    return self.parse_function_call(name);
                 }
                 self.position += 1;
                 if matches!(self.peek_kind(), Some(TokenKind::Dot)) {
@@ -523,6 +549,39 @@ impl Parser {
             arg,
             distinct,
         })
+    }
+
+    fn parse_function_call(&mut self, name: String) -> Result<Expr, CypherError> {
+        self.position += 1; // function name
+        self.expect(&TokenKind::LParen, "`(` after function name")?;
+
+        let mut args = Vec::new();
+        if !matches!(self.peek_kind(), Some(TokenKind::RParen)) {
+            args.push(self.parse_or()?);
+            while matches!(self.peek_kind(), Some(TokenKind::Comma)) {
+                self.position += 1;
+                args.push(self.parse_or()?);
+            }
+        }
+
+        self.expect(&TokenKind::RParen, "`)` to close a function call")?;
+        Ok(Expr::Function { name, args })
+    }
+
+    fn parse_list_literal(&mut self) -> Result<Expr, CypherError> {
+        self.expect(&TokenKind::LBracket, "`[` to start a list")?;
+
+        let mut items = Vec::new();
+        if !matches!(self.peek_kind(), Some(TokenKind::RBracket)) {
+            items.push(self.parse_or()?);
+            while matches!(self.peek_kind(), Some(TokenKind::Comma)) {
+                self.position += 1;
+                items.push(self.parse_or()?);
+            }
+        }
+
+        self.expect(&TokenKind::RBracket, "`]` to close a list")?;
+        Ok(Expr::List(items))
     }
 
     fn parse_literal(&mut self) -> Result<Literal, CypherError> {

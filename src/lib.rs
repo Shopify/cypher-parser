@@ -18,10 +18,11 @@
 //!   (`(v:Class|Module)` matches a node with **any** of the listed labels) — and relationship
 //!   patterns `-[:TYPE]->`, `<-[:TYPE]-`, `-[:TYPE]-`, including variable-length
 //!   `-[:TYPE*min..max]->`.
-//! - `WHERE` with `=`, `<>`, `<`, `<=`, `>`, `>=`, `CONTAINS`, `STARTS WITH`, `ENDS WITH`, combined
-//!   with `AND`, `OR`, `NOT`.
-//! - `RETURN` with `DISTINCT`, `AS` aliases, and the aggregates `count`, `collect`, `min`, `max`,
-//!   `sum`, `avg`.
+//! - `WHERE` with `=`, `<>`, `<`, `<=`, `>`, `>=`, `CONTAINS`, `STARTS WITH`, `ENDS WITH`, `IN`
+//!   (with `[...]` list literals), `IS NULL` / `IS NOT NULL`, combined with `AND`, `OR`, `NOT`.
+//! - Scalar functions `toLower`, `toUpper`, `size`, `coalesce`, `labels`.
+//! - `RETURN` with `DISTINCT`, `*` (all bound variables), `AS` aliases, and the aggregates `count`,
+//!   `collect`, `min`, `max`, `sum`, `avg`.
 //! - `ORDER BY`, `SKIP`, `LIMIT`.
 //!
 //! Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, …) are intentionally not supported.

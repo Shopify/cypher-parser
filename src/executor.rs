@@ -303,9 +303,92 @@ impl<G: GraphProvider> Executor<'_, G> {
                 let right = self.eval_expr(row, b)?;
                 Ok(CypherValue::Bool(compare_values(&left, *op, &right)))
             }
+            Expr::List(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval_expr(row, item)?);
+                }
+                Ok(CypherValue::List(values))
+            }
+            Expr::IsNull(inner, negated) => {
+                let is_null = matches!(self.eval_expr(row, inner)?, CypherValue::Null);
+                Ok(CypherValue::Bool(is_null ^ *negated))
+            }
+            Expr::Function { name, args } => self.eval_function(row, name, args),
             Expr::Aggregate { .. } => Err(CypherError::execution(
                 "aggregate functions are only allowed in RETURN",
             )),
+        }
+    }
+
+    fn eval_function(
+        &self,
+        row: &Row<G::NodeId>,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<CypherValue, CypherError> {
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            "tolower" | "toupper" => {
+                let arg = single_arg(name, args)?;
+                Ok(match self.eval_expr(row, arg)? {
+                    CypherValue::Null => CypherValue::Null,
+                    CypherValue::Str(s) => CypherValue::Str(if lower == "tolower" {
+                        s.to_lowercase()
+                    } else {
+                        s.to_uppercase()
+                    }),
+                    _ => {
+                        return Err(CypherError::execution(format!(
+                            "`{name}` expects a string argument"
+                        )));
+                    }
+                })
+            }
+            "size" => {
+                let arg = single_arg(name, args)?;
+                Ok(match self.eval_expr(row, arg)? {
+                    CypherValue::Null => CypherValue::Null,
+                    CypherValue::Str(s) => {
+                        CypherValue::Int(i64::try_from(s.chars().count()).unwrap_or(i64::MAX))
+                    }
+                    CypherValue::List(items) => {
+                        CypherValue::Int(i64::try_from(items.len()).unwrap_or(i64::MAX))
+                    }
+                    _ => {
+                        return Err(CypherError::execution(
+                            "`size` expects a string or list argument",
+                        ));
+                    }
+                })
+            }
+            "coalesce" => {
+                if args.is_empty() {
+                    return Err(CypherError::execution(
+                        "`coalesce` requires at least one argument",
+                    ));
+                }
+                for arg in args {
+                    let value = self.eval_expr(row, arg)?;
+                    if value != CypherValue::Null {
+                        return Ok(value);
+                    }
+                }
+                Ok(CypherValue::Null)
+            }
+            "labels" => {
+                let arg = single_arg(name, args)?;
+                Ok(match self.eval_expr(row, arg)? {
+                    CypherValue::Null => CypherValue::Null,
+                    CypherValue::Node { label, .. } => {
+                        CypherValue::List(vec![CypherValue::Str(label)])
+                    }
+                    _ => {
+                        return Err(CypherError::execution("`labels` expects a node argument"));
+                    }
+                })
+            }
+            _ => Err(CypherError::execution(format!("unknown function `{name}`"))),
         }
     }
 
@@ -319,6 +402,10 @@ impl<G: GraphProvider> Executor<'_, G> {
     // ---- Projection ------------------------------------------------------
 
     fn project(&self, query: &Query, rows: &[Row<G::NodeId>]) -> Result<ResultSet, CypherError> {
+        if query.return_clause.star {
+            return self.project_star(query, rows);
+        }
+
         let items = &query.return_clause.items;
         let columns: Vec<String> = items.iter().map(ReturnItem::column_name).collect();
 
@@ -329,6 +416,43 @@ impl<G: GraphProvider> Executor<'_, G> {
         } else {
             self.project_simple(query, rows)?
         };
+
+        if query.return_clause.distinct {
+            dedupe(&mut values);
+        }
+
+        apply_order_skip_limit(query, &mut values, &columns)?;
+
+        Ok(ResultSet {
+            columns,
+            rows: values,
+        })
+    }
+
+    fn project_star(
+        &self,
+        query: &Query,
+        rows: &[Row<G::NodeId>],
+    ) -> Result<ResultSet, CypherError> {
+        let columns = star_variables(query);
+        if columns.is_empty() {
+            return Err(CypherError::execution(
+                "RETURN * requires at least one bound variable in the MATCH pattern",
+            ));
+        }
+
+        let mut values: Vec<Vec<CypherValue>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            values.push(
+                columns
+                    .iter()
+                    .map(|var| {
+                        row.get(var)
+                            .map_or(CypherValue::Null, |node| self.node_value(*node))
+                    })
+                    .collect(),
+            );
+        }
 
         if query.return_clause.distinct {
             dedupe(&mut values);
@@ -550,6 +674,38 @@ fn resolve_order_column(
     )))
 }
 
+/// Returns the single argument of a scalar function, or an error if the arity is not exactly one.
+fn single_arg<'a>(name: &str, args: &'a [Expr]) -> Result<&'a Expr, CypherError> {
+    match args {
+        [arg] => Ok(arg),
+        _ => Err(CypherError::execution(format!(
+            "`{name}` expects exactly one argument"
+        ))),
+    }
+}
+
+/// Collects the bound (node) variable names from a query's patterns in declaration order,
+/// deduplicated. These are the columns produced by `RETURN *`.
+fn star_variables(query: &Query) -> Vec<String> {
+    let mut vars = Vec::new();
+    let mut seen = HashSet::new();
+    for pattern in &query.patterns {
+        if let Some(name) = &pattern.start.var
+            && seen.insert(name.clone())
+        {
+            vars.push(name.clone());
+        }
+        for (_, node) in &pattern.rest {
+            if let Some(name) = &node.var
+                && seen.insert(name.clone())
+            {
+                vars.push(name.clone());
+            }
+        }
+    }
+    vars
+}
+
 fn literal_to_value(literal: &Literal) -> CypherValue {
     match literal {
         Literal::Str(value) => CypherValue::Str(value.clone()),
@@ -585,6 +741,10 @@ fn compare_values(left: &CypherValue, op: CmpOp, right: &CypherValue) -> bool {
             string_op(left, right, |haystack, needle| haystack.starts_with(needle))
         }
         CmpOp::EndsWith => string_op(left, right, |haystack, needle| haystack.ends_with(needle)),
+        CmpOp::In => match right {
+            CypherValue::List(items) => items.iter().any(|item| values_equal(left, item)),
+            _ => false,
+        },
     }
 }
 

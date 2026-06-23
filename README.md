@@ -57,10 +57,11 @@ let output = run_query(&my_graph, "MATCH (n:Class) RETURN n.name", OutputFormat:
 
 - **`MATCH`** — node patterns `(v:Label {prop: value})` with label disjunction (`(v:A|B)`); relationship
   patterns `-[:TYPE]->`, `<-[:TYPE]-`, `-[:TYPE]-`, including variable-length `-[:TYPE*min..max]->`.
-- **`WHERE`** — `=`, `<>`, `<`, `<=`, `>`, `>=`, `CONTAINS`, `STARTS WITH`, `ENDS WITH`, combined with
-  `AND`, `OR`, `NOT`.
-- **`RETURN`** — `DISTINCT`, `AS` aliases, and the aggregates `count`, `collect`, `min`, `max`, `sum`,
-  `avg`.
+- **`WHERE`** — `=`, `<>`, `<`, `<=`, `>`, `>=`, `CONTAINS`, `STARTS WITH`, `ENDS WITH`, `IN` (with
+  `[...]` list literals), `IS NULL` / `IS NOT NULL`, combined with `AND`, `OR`, `NOT`.
+- **Scalar functions** — `toLower`, `toUpper`, `size`, `coalesce`, `labels`.
+- **`RETURN`** — `DISTINCT`, `*` (all bound variables), `AS` aliases, and the aggregates `count`,
+  `collect`, `min`, `max`, `sum`, `avg`.
 - **`ORDER BY`**, **`SKIP`**, **`LIMIT`**.
 
 Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) are intentionally unsupported.
@@ -73,6 +74,12 @@ Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) are intentionally u
 - `run_query` — parse + execute + format in one call.
 - `OutputFormat` / `CypherValue` — result formatting and values.
 - `ast` — the AST types; `CypherError` — lexing/parsing/execution errors with a source position.
+
+## Roadmap
+
+Planned syntax additions (`WITH`, `OPTIONAL MATCH`, multi-label `AND`, floats/arithmetic, `UNWIND`,
+`CASE`, …) and their prioritized implementation plans are in [docs/ROADMAP.md](docs/ROADMAP.md)
+(with a quick [docs/CHECKLIST.md](docs/CHECKLIST.md)).
 
 ## Contributing
 

@@ -233,6 +233,113 @@ fn unknown_relationship_type_errors() {
 }
 
 #[test]
+fn in_operator() {
+    let graph = fixture();
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class) WHERE c.name IN ['Dog', 'Cat'] RETURN c.name",
+            0
+        ),
+        vec!["Cat".to_string(), "Dog".to_string()]
+    );
+}
+
+#[test]
+fn is_null_filters() {
+    let graph = fixture();
+    // No Class node has a `line` property, so IS NULL matches all three classes.
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class) WHERE c.line IS NULL RETURN c.name",
+            0
+        ),
+        vec!["Animal".to_string(), "Cat".to_string(), "Dog".to_string()]
+    );
+    // Every class has a name, so IS NULL on name matches nothing and IS NOT NULL matches all.
+    assert!(
+        column(
+            &graph,
+            "MATCH (c:Class) WHERE c.name IS NULL RETURN c.name",
+            0
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class) WHERE c.name IS NOT NULL RETURN c.name",
+            0
+        )
+        .len(),
+        3
+    );
+}
+
+#[test]
+fn return_star_projects_bound_variables() {
+    let graph = fixture();
+    let parsed =
+        parse("MATCH (c:Class)-[:INHERITS]->(p:Class) WHERE c.name = 'Dog' RETURN *").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.columns, vec!["c".to_string(), "p".to_string()]);
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0].to_display_string(), "Dog");
+    assert_eq!(result.rows[0][1].to_display_string(), "Animal");
+}
+
+#[test]
+fn return_star_without_variables_errors() {
+    let graph = fixture();
+    let parsed = parse("MATCH () RETURN *").unwrap();
+    assert!(execute(&graph, &parsed).is_err());
+}
+
+#[test]
+fn scalar_functions() {
+    let graph = fixture();
+
+    // toLower used in a WHERE comparison.
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class) WHERE toLower(c.name) = 'dog' RETURN c.name",
+            0
+        ),
+        vec!["Dog".to_string()]
+    );
+
+    // size of a string property.
+    let parsed = parse("MATCH (c:Class {name: 'Dog'}) RETURN size(c.name)").unwrap();
+    assert_eq!(
+        execute(&graph, &parsed).unwrap().rows[0][0],
+        CypherValue::Int(3)
+    );
+
+    // coalesce returns the first non-null argument.
+    let parsed = parse("MATCH (c:Class {name: 'Dog'}) RETURN coalesce(c.nick, c.name)").unwrap();
+    assert_eq!(
+        execute(&graph, &parsed).unwrap().rows[0][0],
+        CypherValue::Str("Dog".into())
+    );
+
+    // labels returns the node's label wrapped in a list.
+    let parsed = parse("MATCH (c:Class {name: 'Dog'}) RETURN labels(c)").unwrap();
+    assert_eq!(
+        execute(&graph, &parsed).unwrap().rows[0][0],
+        CypherValue::List(vec![CypherValue::Str("Class".into())])
+    );
+}
+
+#[test]
+fn unknown_function_errors() {
+    let graph = fixture();
+    let parsed = parse("MATCH (c:Class) RETURN bogus(c.name)").unwrap();
+    assert!(execute(&graph, &parsed).is_err());
+}
+
+#[test]
 fn run_query_json() {
     let graph = fixture();
     let output = run_query(

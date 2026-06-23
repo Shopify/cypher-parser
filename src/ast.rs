@@ -68,6 +68,8 @@ pub enum Literal {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Return {
     pub distinct: bool,
+    /// `RETURN *` — project every bound pattern variable. When set, `items` is empty.
+    pub star: bool,
     pub items: Vec<ReturnItem>,
 }
 
@@ -92,10 +94,19 @@ pub enum Expr {
     Var(String),
     Property(String, String),
     Literal(Literal),
+    /// A list literal such as `['a', 'b']`.
+    List(Vec<Expr>),
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Compare(Box<Expr>, CmpOp, Box<Expr>),
+    /// `expr IS NULL` / `expr IS NOT NULL`; the bool is `true` when negated (`IS NOT NULL`).
+    IsNull(Box<Expr>, bool),
+    /// A scalar function call such as `toLower(c.name)` or `coalesce(a, b)`.
+    Function {
+        name: String,
+        args: Vec<Expr>,
+    },
     Aggregate {
         func: AggFn,
         arg: Option<Box<Expr>>,
@@ -110,9 +121,11 @@ impl Expr {
     pub fn contains_aggregate(&self) -> bool {
         match self {
             Expr::Aggregate { .. } => true,
-            Expr::Not(inner) => inner.contains_aggregate(),
+            Expr::Not(inner) | Expr::IsNull(inner, _) => inner.contains_aggregate(),
             Expr::And(a, b) | Expr::Or(a, b) => a.contains_aggregate() || b.contains_aggregate(),
             Expr::Compare(a, _, b) => a.contains_aggregate() || b.contains_aggregate(),
+            Expr::List(items) => items.iter().any(Expr::contains_aggregate),
+            Expr::Function { args, .. } => args.iter().any(Expr::contains_aggregate),
             Expr::Var(_) | Expr::Property(..) | Expr::Literal(_) => false,
         }
     }
@@ -129,6 +142,18 @@ impl Expr {
                 Literal::Bool(b) => b.to_string(),
                 Literal::Null => "null".to_string(),
             },
+            Expr::List(items) => {
+                let inner: Vec<String> = items.iter().map(Expr::display_name).collect();
+                format!("[{}]", inner.join(", "))
+            }
+            Expr::IsNull(inner, negated) => {
+                let not = if *negated { " NOT" } else { "" };
+                format!("{} IS{not} NULL", inner.display_name())
+            }
+            Expr::Function { name, args } => {
+                let inner: Vec<String> = args.iter().map(Expr::display_name).collect();
+                format!("{name}({})", inner.join(", "))
+            }
             Expr::Not(inner) => format!("NOT {}", inner.display_name()),
             Expr::And(a, b) => format!("{} AND {}", a.display_name(), b.display_name()),
             Expr::Or(a, b) => format!("{} OR {}", a.display_name(), b.display_name()),
@@ -162,6 +187,7 @@ pub enum CmpOp {
     Contains,
     StartsWith,
     EndsWith,
+    In,
 }
 
 impl CmpOp {
@@ -177,6 +203,7 @@ impl CmpOp {
             CmpOp::Contains => "CONTAINS",
             CmpOp::StartsWith => "STARTS WITH",
             CmpOp::EndsWith => "ENDS WITH",
+            CmpOp::In => "IN",
         }
     }
 }
