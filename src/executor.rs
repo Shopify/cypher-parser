@@ -394,6 +394,7 @@ impl<G: GraphProvider> Executor<'_, G> {
 
     fn node_value(&self, node: G::NodeId) -> CypherValue {
         CypherValue::Node {
+            id: self.graph.node_id(node),
             label: self.graph.label(node),
             name: self.graph.name(node),
         }

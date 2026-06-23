@@ -40,6 +40,14 @@ pub trait GraphProvider {
     /// Returns the value of property `prop` on `node`, or [`CypherValue::Null`] if it is absent.
     fn property(&self, node: Self::NodeId, prop: &str) -> CypherValue;
 
+    /// Returns a stable, opaque identifier for `node`, carried through to returned nodes so
+    /// consumers can map a result back to their own object.
+    ///
+    /// The crate never interprets this string — it only compares it for identity (so distinct
+    /// nodes get distinct ids) and never includes it in table or JSON output. Encode whatever the
+    /// consumer needs to round-trip a node (for example a type tag plus a primary key).
+    fn node_id(&self, node: Self::NodeId) -> String;
+
     /// Returns the node's primary label, used when a bound node is returned directly.
     fn label(&self, node: Self::NodeId) -> String;
 

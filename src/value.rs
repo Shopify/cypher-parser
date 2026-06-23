@@ -8,8 +8,10 @@ pub enum CypherValue {
     Bool(bool),
     Int(i64),
     Str(String),
-    /// A graph node, rendered with its label and primary name.
+    /// A graph node. `id` is the provider's stable, opaque identity for the node (used for equality
+    /// and grouping, never displayed); `label` and `name` are what gets rendered.
     Node {
+        id: String,
         label: String,
         name: String,
     },
@@ -108,7 +110,7 @@ impl CypherValue {
                 let _ = write!(out, "{i}");
             }
             CypherValue::Str(s) => write_json_string(out, s),
-            CypherValue::Node { label, name } => {
+            CypherValue::Node { label, name, .. } => {
                 out.push_str("{\"label\":");
                 write_json_string(out, label);
                 out.push_str(",\"name\":");

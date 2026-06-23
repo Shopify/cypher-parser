@@ -88,6 +88,12 @@ impl GraphProvider for TestGraph {
             .map_or(CypherValue::Null, |value| CypherValue::Str(value.clone()))
     }
 
+    fn node_id(&self, node: usize) -> String {
+        // A stable, opaque identity. Here we use the node's index; a real provider would encode
+        // whatever it needs to round-trip the node (e.g. a type tag plus a primary key).
+        format!("node:{node}")
+    }
+
     fn label(&self, node: usize) -> String {
         self.nodes[node].labels.first().cloned().unwrap_or_default()
     }
@@ -340,6 +346,46 @@ fn unknown_function_errors() {
 }
 
 #[test]
+fn returned_node_carries_id() {
+    let graph = fixture();
+    // Dog is the second node added (index 1).
+    let parsed = parse("MATCH (c:Class {name: 'Dog'}) RETURN c").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        CypherValue::Node { id, label, name } => {
+            assert_eq!(id, "node:1");
+            assert_eq!(label, "Class");
+            assert_eq!(name, "Dog");
+        }
+        other => panic!("expected a node value, got {other:?}"),
+    }
+}
+
+#[test]
+fn distinct_dedupes_nodes_by_identity() {
+    let graph = fixture();
+    // Dog and Cat both INHERIT Animal, so the same Animal node is produced twice; DISTINCT
+    // collapses it to one row because the identity (id) is equal.
+    let parsed = parse("MATCH (c:Class)-[:INHERITS]->(p:Class) RETURN DISTINCT p").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0].to_display_string(), "Animal");
+}
+
+#[test]
+fn distinct_keeps_distinct_nodes_sharing_a_name() {
+    // Two separate nodes share the name "Dup" but have distinct ids, so DISTINCT keeps both —
+    // identity, not name, drives deduplication.
+    let mut graph = TestGraph::default();
+    graph.add_node(&["Class"], &[("name", "Dup")]);
+    graph.add_node(&["Class"], &[("name", "Dup")]);
+    let parsed = parse("MATCH (c:Class) RETURN DISTINCT c").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
 fn run_query_json() {
     let graph = fixture();
     let output = run_query(
@@ -349,4 +395,17 @@ fn run_query_json() {
     )
     .unwrap();
     assert_eq!(output, "[{\"c.name\":\"Dog\"}]");
+}
+
+#[test]
+fn node_json_does_not_leak_id() {
+    let graph = fixture();
+    let output = run_query(
+        &graph,
+        "MATCH (c:Class {name: 'Dog'}) RETURN c",
+        OutputFormat::Json,
+    )
+    .unwrap();
+    // The opaque node id is used for identity only and must never appear in the output.
+    assert_eq!(output, "[{\"c\":{\"label\":\"Class\",\"name\":\"Dog\"}}]");
 }

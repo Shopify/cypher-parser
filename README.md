@@ -46,6 +46,7 @@ impl GraphProvider for MyGraph {
     fn expand(&self, node: usize, rel_type: &str) -> Vec<usize> { /* ... */ }
     fn rel_sources(&self, rel_type: &str) -> Vec<usize> { /* ... */ }
     fn property(&self, node: usize, prop: &str) -> CypherValue { /* ... */ }
+    fn node_id(&self, node: usize) -> String { /* stable, opaque identity */ }
     fn label(&self, node: usize) -> String { /* ... */ }
     fn name(&self, node: usize) -> String { /* ... */ }
 }
