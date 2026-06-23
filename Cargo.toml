@@ -1,0 +1,20 @@
+[package]
+name = "cypher-parser"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89.0"
+license = "MIT"
+description = "A lexer and recursive-descent parser for a practical subset of the Cypher graph query language."
+homepage = "https://github.com/Shopify/cypher-parser"
+repository = "https://github.com/Shopify/cypher-parser"
+readme = "README.md"
+keywords = ["cypher", "parser", "graph", "query", "opencypher"]
+categories = ["parser-implementations"]
+
+# Standalone workspace root so the crate is never absorbed by a parent workspace.
+[workspace]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
