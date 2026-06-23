@@ -1,13 +1,18 @@
 # cypher-parser
 
-A small, dependency-free lexer and recursive-descent parser for a practical subset of the
+A small, dependency-free lexer, parser, and pluggable executor for a practical subset of the
 [Cypher](https://opencypher.org/) graph query language.
 
-It turns a query string into an AST (or a positioned error) and leaves execution to the caller, so
-it can front any graph or in-memory data structure. It targets read-only, introspection-style
-queries.
+It has two layers:
 
-## Usage
+1. **Parsing** turns a query string into an AST (or a positioned error).
+2. **Execution** evaluates a parsed query against *any* backend that implements the
+   [`GraphProvider`] trait, returning a result set you can render as a table or JSON. The executor
+   is generic and reads your graph only through that trait.
+
+It targets read-only, introspection-style queries.
+
+## Parsing
 
 ```rust
 use cypher_parser::parse;
@@ -25,6 +30,29 @@ for item in &query.return_clause.items {
 # Ok::<(), cypher_parser::CypherError>(())
 ```
 
+## Executing against your own graph
+
+Implement [`GraphProvider`] for your data structure, then call `run_query` (or `execute` for a
+structured `ResultSet`):
+
+```rust,ignore
+use cypher_parser::{run_query, GraphProvider, CypherValue, OutputFormat};
+
+impl GraphProvider for MyGraph {
+    type NodeId = usize;
+    fn scan(&self, labels: &[String]) -> Vec<usize> { /* ... */ }
+    fn matches_label(&self, node: usize, label: &str) -> bool { /* ... */ }
+    fn relationship_types(&self) -> Vec<String> { /* ... */ }
+    fn expand(&self, node: usize, rel_type: &str) -> Vec<usize> { /* ... */ }
+    fn rel_sources(&self, rel_type: &str) -> Vec<usize> { /* ... */ }
+    fn property(&self, node: usize, prop: &str) -> CypherValue { /* ... */ }
+    fn label(&self, node: usize) -> String { /* ... */ }
+    fn name(&self, node: usize) -> String { /* ... */ }
+}
+
+let output = run_query(&my_graph, "MATCH (n:Class) RETURN n.name", OutputFormat::Json)?;
+```
+
 ## Supported subset
 
 - **`MATCH`** — node patterns `(v:Label {prop: value})` with label disjunction (`(v:A|B)`); relationship
@@ -39,9 +67,12 @@ Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) are intentionally u
 
 ## API
 
-- [`parse`] — parse a query string into a [`ast::Query`].
-- [`ast`] — the AST types.
-- [`error::CypherError`] — lexing/parsing errors, with a byte position into the source.
+- `parse` — parse a query string into a `Query` AST.
+- `GraphProvider` — implement this for your graph to make it queryable.
+- `execute` — run a parsed query, returning a `ResultSet`.
+- `run_query` — parse + execute + format in one call.
+- `OutputFormat` / `CypherValue` — result formatting and values.
+- `ast` — the AST types; `CypherError` — lexing/parsing/execution errors with a source position.
 
 ## Contributing
 

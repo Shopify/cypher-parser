@@ -1,0 +1,245 @@
+//! Executor tests against a small in-memory `GraphProvider`, demonstrating that the executor is
+//! generic over any backend (not tied to any particular graph implementation).
+
+use std::collections::HashMap;
+
+use cypher_parser::{CypherValue, GraphProvider, OutputFormat, execute, parse, run_query};
+
+struct Node {
+    labels: Vec<String>,
+    props: HashMap<String, String>,
+}
+
+struct Edge {
+    from: usize,
+    rel: String,
+    to: usize,
+}
+
+#[derive(Default)]
+struct TestGraph {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+}
+
+impl TestGraph {
+    fn add_node(&mut self, labels: &[&str], props: &[(&str, &str)]) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            labels: labels.iter().map(|s| (*s).to_string()).collect(),
+            props: props
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        });
+        id
+    }
+
+    fn add_edge(&mut self, from: usize, rel: &str, to: usize) {
+        self.edges.push(Edge {
+            from,
+            rel: rel.to_string(),
+            to,
+        });
+    }
+}
+
+impl GraphProvider for TestGraph {
+    type NodeId = usize;
+
+    fn scan(&self, labels: &[String]) -> Vec<usize> {
+        (0..self.nodes.len())
+            .filter(|id| {
+                labels.is_empty() || labels.iter().any(|label| self.matches_label(*id, label))
+            })
+            .collect()
+    }
+
+    fn matches_label(&self, node: usize, label: &str) -> bool {
+        self.nodes[node].labels.iter().any(|l| l == label)
+    }
+
+    fn relationship_types(&self) -> Vec<String> {
+        let mut types: Vec<String> = Vec::new();
+        for edge in &self.edges {
+            if !types.contains(&edge.rel) {
+                types.push(edge.rel.clone());
+            }
+        }
+        types
+    }
+
+    fn expand(&self, node: usize, rel_type: &str) -> Vec<usize> {
+        self.edges
+            .iter()
+            .filter(|e| e.from == node && e.rel == rel_type)
+            .map(|e| e.to)
+            .collect()
+    }
+
+    fn rel_sources(&self, _rel_type: &str) -> Vec<usize> {
+        (0..self.nodes.len()).collect()
+    }
+
+    fn property(&self, node: usize, prop: &str) -> CypherValue {
+        self.nodes[node]
+            .props
+            .get(prop)
+            .map_or(CypherValue::Null, |value| CypherValue::Str(value.clone()))
+    }
+
+    fn label(&self, node: usize) -> String {
+        self.nodes[node].labels.first().cloned().unwrap_or_default()
+    }
+
+    fn name(&self, node: usize) -> String {
+        self.nodes[node]
+            .props
+            .get("name")
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Builds: classes Animal, Dog, Cat; module Walkable.
+/// Dog -INHERITS-> Animal, Cat -INHERITS-> Animal, Dog -INCLUDES-> Walkable.
+fn fixture() -> TestGraph {
+    let mut graph = TestGraph::default();
+    let animal = graph.add_node(&["Class"], &[("name", "Animal")]);
+    let dog = graph.add_node(&["Class"], &[("name", "Dog")]);
+    let cat = graph.add_node(&["Class"], &[("name", "Cat")]);
+    let walkable = graph.add_node(&["Module"], &[("name", "Walkable")]);
+    graph.add_edge(dog, "INHERITS", animal);
+    graph.add_edge(cat, "INHERITS", animal);
+    graph.add_edge(dog, "INCLUDES", walkable);
+    graph
+}
+
+fn column(graph: &TestGraph, query: &str, col: usize) -> Vec<String> {
+    let parsed = parse(query).unwrap();
+    let result = execute(graph, &parsed).unwrap();
+    let mut values: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| row[col].to_display_string())
+        .collect();
+    values.sort();
+    values
+}
+
+#[test]
+fn scan_by_label_and_property() {
+    let graph = fixture();
+    assert_eq!(
+        column(&graph, "MATCH (c:Class {name: 'Dog'}) RETURN c.name", 0),
+        vec!["Dog".to_string()]
+    );
+}
+
+#[test]
+fn outgoing_relationship() {
+    let graph = fixture();
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class)-[:INHERITS]->(p:Class) WHERE c.name = 'Dog' RETURN p.name",
+            0
+        ),
+        vec!["Animal".to_string()]
+    );
+}
+
+#[test]
+fn incoming_relationship() {
+    let graph = fixture();
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (p:Class)<-[:INHERITS]-(c:Class) WHERE p.name = 'Animal' RETURN c.name",
+            0
+        ),
+        vec!["Cat".to_string(), "Dog".to_string()]
+    );
+}
+
+#[test]
+fn label_disjunction() {
+    let graph = fixture();
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (n:Class|Module) WHERE n.name = 'Animal' OR n.name = 'Walkable' RETURN n.name",
+            0
+        ),
+        vec!["Animal".to_string(), "Walkable".to_string()]
+    );
+}
+
+#[test]
+fn variable_length() {
+    let graph = fixture();
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class)-[:INHERITS*1..]->(a) WHERE c.name = 'Dog' RETURN a.name",
+            0
+        ),
+        vec!["Animal".to_string()]
+    );
+}
+
+#[test]
+fn includes_mixin() {
+    let graph = fixture();
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class)-[:INCLUDES]->(m) WHERE c.name = 'Dog' RETURN m.name",
+            0
+        ),
+        vec!["Walkable".to_string()]
+    );
+}
+
+#[test]
+fn aggregation_counts() {
+    let graph = fixture();
+    let parsed =
+        parse("MATCH (c:Class)-[:INHERITS]->(p:Class) WHERE p.name = 'Animal' RETURN p.name, count(c) AS subs")
+            .unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], CypherValue::Str("Animal".into()));
+    assert_eq!(result.rows[0][1], CypherValue::Int(2));
+}
+
+#[test]
+fn distinct_order_limit() {
+    let graph = fixture();
+    let parsed = parse(
+        "MATCH (c:Class)-[:INHERITS]->(p:Class) RETURN DISTINCT p.name ORDER BY p.name LIMIT 1",
+    )
+    .unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], CypherValue::Str("Animal".into()));
+}
+
+#[test]
+fn unknown_relationship_type_errors() {
+    let graph = fixture();
+    let parsed = parse("MATCH (a)-[:BOGUS]->(b) RETURN a").unwrap();
+    assert!(execute(&graph, &parsed).is_err());
+}
+
+#[test]
+fn run_query_json() {
+    let graph = fixture();
+    let output = run_query(
+        &graph,
+        "MATCH (c:Class {name: 'Dog'}) RETURN c.name",
+        OutputFormat::Json,
+    )
+    .unwrap();
+    assert_eq!(output, "[{\"c.name\":\"Dog\"}]");
+}

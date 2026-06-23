@@ -1,9 +1,16 @@
-//! A hand-written lexer, recursive-descent parser, and AST for a practical subset of the
-//! [Cypher](https://opencypher.org/) graph query language.
+//! A hand-written lexer, recursive-descent parser, and tree-walking executor for a practical subset
+//! of the [Cypher](https://opencypher.org/) graph query language.
 //!
-//! This crate is dependency-free and execution-agnostic: it turns a query string into a [`Query`]
-//! AST (or a positioned [`CypherError`]) and leaves evaluation to the caller. It is intended for
-//! read-only, introspection-style queries.
+//! The crate has two layers:
+//!
+//! 1. **Parsing** ([`parse`]) turns a query string into a [`Query`] AST (or a positioned
+//!    [`CypherError`]). This layer is execution-agnostic.
+//! 2. **Execution** ([`execute`] / [`run_query`]) evaluates a parsed query against any backend that
+//!    implements the [`GraphProvider`] trait, producing a [`ResultSet`] that can be rendered as a
+//!    table or JSON via [`OutputFormat`]. Implement [`GraphProvider`] for your own graph to make it
+//!    queryable — the executor is generic and reads the graph only through that trait.
+//!
+//! It targets read-only, introspection-style queries.
 //!
 //! # Supported subset
 //!
@@ -28,12 +35,38 @@
 //! assert_eq!(query.patterns.len(), 1);
 //! assert_eq!(query.return_clause.items.len(), 1);
 //! ```
+//!
+//! To execute queries, implement [`GraphProvider`] for your data and call [`run_query`] or
+//! [`execute`].
 
 pub mod ast;
 pub mod error;
+pub mod executor;
+pub mod format;
 pub mod lexer;
 pub mod parser;
+pub mod provider;
+pub mod value;
 
 pub use ast::Query;
 pub use error::CypherError;
+pub use executor::{ResultSet, execute};
+pub use format::OutputFormat;
 pub use parser::parse;
+pub use provider::GraphProvider;
+pub use value::CypherValue;
+
+/// Parses and executes a query against a [`GraphProvider`], returning the formatted output.
+///
+/// # Errors
+///
+/// Returns a [`CypherError`] if the query cannot be parsed or executed.
+pub fn run_query<G: GraphProvider>(
+    graph: &G,
+    query: &str,
+    output_format: OutputFormat,
+) -> Result<String, CypherError> {
+    let parsed = parser::parse(query)?;
+    let result = executor::execute(graph, &parsed)?;
+    Ok(format::format(&result, output_format))
+}
