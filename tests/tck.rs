@@ -297,6 +297,23 @@ fn match5_variable_length() {
     }
 }
 
+/// TCK: tck/features/useCases/triadicSelection/TriadicSelection1.feature
+/// Scenario: [2] Handling triadic friend of a friend that is not a friend.
+///
+/// The TCK writes the anti-join with a relationship variable and `OPTIONAL MATCH (a)-[r:KNOWS]->(c)
+/// WITH c WHERE r IS NULL`. This crate does not bind relationship variables, so we express the same
+/// "c is not a KNOWS-target of a" semantics with `NOT EXISTS`. Expected results are verbatim.
+#[test]
+fn triadic_selection_1_not_a_friend() {
+    let graph = binary_tree_1();
+    let got = column_sorted(
+        &graph,
+        "MATCH (a:A)-[:KNOWS]->(b)-->(c) WHERE NOT EXISTS { (a)-[:KNOWS]->(c) } RETURN c.name",
+        0,
+    );
+    assert_eq!(got, sorted(&["b3", "c11", "c12", "c21", "c22"]));
+}
+
 /// TCK: tck/features/clauses/match/Match1.feature
 /// Scenario: [1] Match non-existent nodes returns empty
 #[test]

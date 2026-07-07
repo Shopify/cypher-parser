@@ -26,6 +26,8 @@
 //! - `WITH` to chain clauses: project (with the same features as `RETURN`, including aggregates)
 //!   into a new set of bindings, with an optional trailing `WHERE` — enabling post-aggregation
 //!   filtering such as `MATCH ... WITH n, count(*) AS c WHERE c > 1 RETURN ...`.
+//! - `OPTIONAL MATCH` (left join: unmatched rows are kept with the clause's new variables null).
+//! - `EXISTS { [MATCH] pattern [WHERE ...] }` existential subquery predicate (and `NOT EXISTS`).
 //! - `ORDER BY`, `SKIP`, `LIMIT` (on both `WITH` and `RETURN`).
 //!
 //! Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, …) are intentionally not supported.

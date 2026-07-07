@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -50,6 +51,9 @@ type WithOutput<N> = (Vec<String>, Vec<Row<N>>);
 /// Output column names paired with the projected rows of a projection.
 type ProjectedRows<N> = (Vec<String>, Vec<Projected<N>>);
 
+/// Lazily-built reverse adjacency (target -> sources) per relationship type.
+type ReverseCache<N> = RefCell<HashMap<String, HashMap<N, Vec<N>>>>;
+
 /// Executes a parsed query against any [`GraphProvider`].
 ///
 /// # Errors
@@ -57,25 +61,31 @@ type ProjectedRows<N> = (Vec<String>, Vec<Projected<N>>);
 /// Returns a [`CypherError::Execution`] for unknown relationship types, aggregates used in `WHERE`,
 /// or `ORDER BY` expressions that cannot be resolved against the projection.
 pub fn execute<G: GraphProvider>(graph: &G, query: &Query) -> Result<ResultSet, CypherError> {
-    let mut executor = Executor {
+    let executor = Executor {
         graph,
-        reverse_cache: HashMap::new(),
+        reverse_cache: RefCell::new(HashMap::new()),
     };
     executor.run(query)
 }
 
 struct Executor<'a, G: GraphProvider> {
     graph: &'a G,
-    reverse_cache: HashMap<String, HashMap<G::NodeId, Vec<G::NodeId>>>,
+    /// Lazily-built reverse adjacency (target -> sources) per relationship type, for incoming and
+    /// undirected traversal. Behind a `RefCell` so pattern matching can run through `&self` (needed
+    /// to evaluate `EXISTS` predicates during expression evaluation).
+    reverse_cache: ReverseCache<G::NodeId>,
 }
 
 impl<G: GraphProvider> Executor<'_, G> {
-    fn run(&mut self, query: &Query) -> Result<ResultSet, CypherError> {
+    fn run(&self, query: &Query) -> Result<ResultSet, CypherError> {
         let mut rows: Vec<Row<G::NodeId>> = vec![Row::new()];
         let mut scope: Vec<String> = Vec::new();
 
         for clause in &query.clauses {
             match clause {
+                Clause::Match(m) if m.optional => {
+                    rows = self.run_optional_match(rows, m, &mut scope)?;
+                }
                 Clause::Match(m) => rows = self.run_match(rows, m, &mut scope)?,
                 Clause::With(w) => {
                     let (columns, rows_after) = self.run_with(&rows, w, &scope)?;
@@ -95,7 +105,7 @@ impl<G: GraphProvider> Executor<'_, G> {
     }
 
     fn run_match(
-        &mut self,
+        &self,
         mut rows: Vec<Row<G::NodeId>>,
         clause: &MatchClause,
         scope: &mut Vec<String>,
@@ -108,6 +118,50 @@ impl<G: GraphProvider> Executor<'_, G> {
             rows = self.filter_rows(rows, predicate)?;
         }
         Ok(rows)
+    }
+
+    /// Runs `OPTIONAL MATCH`: a left join. For each input row, the patterns (and the clause's
+    /// `WHERE`) are matched independently; if nothing matches, the input row is kept with the
+    /// clause's newly introduced variables bound to null.
+    fn run_optional_match(
+        &self,
+        rows: Vec<Row<G::NodeId>>,
+        clause: &MatchClause,
+        scope: &mut Vec<String>,
+    ) -> Result<Vec<Row<G::NodeId>>, CypherError> {
+        // Variables introduced by this clause that are not already in scope; these are nulled out
+        // for input rows that produce no match.
+        let mut new_vars: Vec<String> = Vec::new();
+        for pattern in &clause.patterns {
+            add_pattern_vars(&mut new_vars, pattern);
+        }
+        new_vars.retain(|var| !scope.contains(var));
+
+        let mut output = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut matched = vec![row.clone()];
+            for pattern in &clause.patterns {
+                matched = self.eval_pattern(matched, pattern)?;
+            }
+            if let Some(predicate) = &clause.where_clause {
+                matched = self.filter_rows(matched, predicate)?;
+            }
+
+            if matched.is_empty() {
+                let mut null_row = row;
+                for var in &new_vars {
+                    null_row.insert(var.clone(), Binding::Value(CypherValue::Null));
+                }
+                output.push(null_row);
+            } else {
+                output.extend(matched);
+            }
+        }
+
+        for pattern in &clause.patterns {
+            add_pattern_vars(scope, pattern);
+        }
+        Ok(output)
     }
 
     fn run_with(
@@ -149,7 +203,7 @@ impl<G: GraphProvider> Executor<'_, G> {
     // ---- Pattern matching ------------------------------------------------
 
     fn eval_pattern(
-        &mut self,
+        &self,
         base: Vec<Row<G::NodeId>>,
         pattern: &PathPattern,
     ) -> Result<Vec<Row<G::NodeId>>, CypherError> {
@@ -190,7 +244,7 @@ impl<G: GraphProvider> Executor<'_, G> {
     }
 
     fn expand_step(
-        &mut self,
+        &self,
         working: Working<G::NodeId>,
         rel: &crate::ast::RelPattern,
         node: &NodePattern,
@@ -226,7 +280,7 @@ impl<G: GraphProvider> Executor<'_, G> {
     }
 
     fn step_targets(
-        &mut self,
+        &self,
         node: G::NodeId,
         rel_types: &[String],
         direction: Direction,
@@ -248,7 +302,7 @@ impl<G: GraphProvider> Executor<'_, G> {
         targets
     }
 
-    fn step_once(&mut self, node: G::NodeId, rel: &str, direction: Direction) -> Vec<G::NodeId> {
+    fn step_once(&self, node: G::NodeId, rel: &str, direction: Direction) -> Vec<G::NodeId> {
         match direction {
             Direction::Outgoing => self.graph.expand(node, rel),
             Direction::Incoming => self.incoming(node, rel),
@@ -270,18 +324,21 @@ impl<G: GraphProvider> Executor<'_, G> {
         }
     }
 
-    fn incoming(&mut self, node: G::NodeId, rel: &str) -> Vec<G::NodeId> {
-        if !self.reverse_cache.contains_key(rel) {
+    fn incoming(&self, node: G::NodeId, rel: &str) -> Vec<G::NodeId> {
+        if !self.reverse_cache.borrow().contains_key(rel) {
             let mut reverse: HashMap<G::NodeId, Vec<G::NodeId>> = HashMap::new();
             for source in self.graph.rel_sources(rel) {
                 for target in self.graph.expand(source, rel) {
                     reverse.entry(target).or_default().push(source);
                 }
             }
-            self.reverse_cache.insert(rel.to_string(), reverse);
+            self.reverse_cache
+                .borrow_mut()
+                .insert(rel.to_string(), reverse);
         }
 
         self.reverse_cache
+            .borrow()
             .get(rel)
             .and_then(|reverse| reverse.get(&node))
             .cloned()
@@ -289,7 +346,7 @@ impl<G: GraphProvider> Executor<'_, G> {
     }
 
     fn var_length_targets(
-        &mut self,
+        &self,
         start: G::NodeId,
         rel_types: &[String],
         direction: Direction,
@@ -404,6 +461,19 @@ impl<G: GraphProvider> Executor<'_, G> {
             Expr::IsNull(inner, negated) => {
                 let is_null = matches!(self.eval_expr(row, inner)?, CypherValue::Null);
                 Ok(CypherValue::Bool(is_null ^ *negated))
+            }
+            Expr::Exists {
+                patterns,
+                where_clause,
+            } => {
+                let mut rows = vec![row.clone()];
+                for pattern in patterns {
+                    rows = self.eval_pattern(rows, pattern)?;
+                }
+                if let Some(predicate) = where_clause {
+                    rows = self.filter_rows(rows, predicate)?;
+                }
+                Ok(CypherValue::Bool(!rows.is_empty()))
             }
             Expr::Function { name, args } => self.eval_function(row, name, args),
             Expr::Aggregate { .. } => Err(CypherError::execution(

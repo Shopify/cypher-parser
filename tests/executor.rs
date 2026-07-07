@@ -435,6 +435,84 @@ fn with_order_skip_limit_in_pipeline() {
 }
 
 #[test]
+fn optional_match_left_join() {
+    let graph = fixture();
+    // Every class is kept; Animal has no outgoing INHERITS, so its p is null (empty display).
+    let parsed =
+        parse("MATCH (c:Class) OPTIONAL MATCH (c)-[:INHERITS]->(p:Class) RETURN c.name, p.name")
+            .unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    let mut rows: Vec<(String, String)> = result
+        .rows
+        .iter()
+        .map(|r| (r[0].to_display_string(), r[1].to_display_string()))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("Animal".to_string(), String::new()),
+            ("Cat".to_string(), "Animal".to_string()),
+            ("Dog".to_string(), "Animal".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn optional_match_is_null_anti_join() {
+    let graph = fixture();
+    // OPTIONAL MATCH + IS NULL: classes with no outgoing INHERITS -> Animal.
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class) OPTIONAL MATCH (c)-[:INHERITS]->(p) WITH c, p WHERE p IS NULL RETURN c.name",
+            0
+        ),
+        vec!["Animal".to_string()]
+    );
+}
+
+#[test]
+fn not_exists_anti_join() {
+    let graph = fixture();
+    // First-class NOT EXISTS: classes with no outgoing INHERITS edge -> Animal.
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class) WHERE NOT EXISTS { (c)-[:INHERITS]->() } RETURN c.name",
+            0
+        ),
+        vec!["Animal".to_string()]
+    );
+}
+
+#[test]
+fn exists_predicate_positive() {
+    let graph = fixture();
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class) WHERE EXISTS { (c)-[:INHERITS]->(:Class) } RETURN c.name",
+            0
+        ),
+        vec!["Cat".to_string(), "Dog".to_string()]
+    );
+}
+
+#[test]
+fn exists_predicate_with_inner_where() {
+    let graph = fixture();
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class) WHERE EXISTS { (c)-[:INHERITS]->(p) WHERE p.name = 'Animal' } RETURN c.name",
+            0
+        ),
+        vec!["Cat".to_string(), "Dog".to_string()]
+    );
+}
+
+#[test]
 fn run_query_json() {
     let graph = fixture();
     let output = run_query(

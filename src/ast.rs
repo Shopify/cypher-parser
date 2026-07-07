@@ -20,6 +20,9 @@ pub enum Clause {
 /// A `MATCH` clause: comma-separated path patterns with an optional `WHERE` filter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchClause {
+    /// `true` for `OPTIONAL MATCH` (left-join: rows with no match are kept with the clause's new
+    /// variables bound to null).
+    pub optional: bool,
     pub patterns: Vec<PathPattern>,
     pub where_clause: Option<Expr>,
 }
@@ -141,6 +144,13 @@ pub enum Expr {
     Compare(Box<Expr>, CmpOp, Box<Expr>),
     /// `expr IS NULL` / `expr IS NOT NULL`; the bool is `true` when negated (`IS NOT NULL`).
     IsNull(Box<Expr>, bool),
+    /// An existential subquery predicate `EXISTS { [MATCH] patterns [WHERE ...] }`. Evaluates to a
+    /// boolean: whether the patterns match at least once given the current bindings. `NOT EXISTS`
+    /// is expressed as [`Expr::Not`] wrapping this.
+    Exists {
+        patterns: Vec<PathPattern>,
+        where_clause: Option<Box<Expr>>,
+    },
     /// A scalar function call such as `toLower(c.name)` or `coalesce(a, b)`.
     Function {
         name: String,
@@ -165,7 +175,9 @@ impl Expr {
             Expr::Compare(a, _, b) => a.contains_aggregate() || b.contains_aggregate(),
             Expr::List(items) => items.iter().any(Expr::contains_aggregate),
             Expr::Function { args, .. } => args.iter().any(Expr::contains_aggregate),
-            Expr::Var(_) | Expr::Property(..) | Expr::Literal(_) => false,
+            // An EXISTS subquery is an opaque boolean; aggregates inside it do not affect the
+            // outer projection's grouping.
+            Expr::Var(_) | Expr::Property(..) | Expr::Literal(_) | Expr::Exists { .. } => false,
         }
     }
 
@@ -189,6 +201,7 @@ impl Expr {
                 let not = if *negated { " NOT" } else { "" };
                 format!("{} IS{not} NULL", inner.display_name())
             }
+            Expr::Exists { .. } => "EXISTS { ... }".to_string(),
             Expr::Function { name, args } => {
                 let inner: Vec<String> = args.iter().map(Expr::display_name).collect();
                 format!("{name}({})", inner.join(", "))

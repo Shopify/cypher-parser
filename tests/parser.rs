@@ -226,6 +226,51 @@ fn parses_with_clause() {
 }
 
 #[test]
+fn parses_optional_match() {
+    let query = parse("MATCH (a:Class) OPTIONAL MATCH (a)-[:INHERITS]->(b) RETURN a").unwrap();
+    assert_eq!(query.clauses.len(), 2);
+
+    let Some(Clause::Match(m0)) = query.clauses.first() else {
+        panic!("expected MATCH");
+    };
+    assert!(!m0.optional);
+
+    let Some(Clause::Match(m1)) = query.clauses.get(1) else {
+        panic!("expected OPTIONAL MATCH");
+    };
+    assert!(m1.optional);
+    assert_eq!(m1.patterns[0].rest.len(), 1);
+}
+
+#[test]
+fn parses_exists_predicate() {
+    // NOT EXISTS { ... } parses as Not(Exists { ... }).
+    let query = parse("MATCH (c) WHERE NOT EXISTS { (c)-[:INHERITS]->() } RETURN c").unwrap();
+    let Some(Expr::Not(inner)) = where_clause(&query) else {
+        panic!("expected NOT");
+    };
+    let Expr::Exists {
+        patterns,
+        where_clause: inner_where,
+    } = *inner
+    else {
+        panic!("expected EXISTS");
+    };
+    assert_eq!(patterns.len(), 1);
+    assert!(inner_where.is_none());
+
+    // EXISTS with an inner WHERE and an explicit MATCH keyword.
+    let with_where = parse(
+        "MATCH (c) WHERE EXISTS { MATCH (c)-[:INHERITS]->(p) WHERE p.name = 'Animal' } RETURN c",
+    )
+    .unwrap();
+    let Some(Expr::Exists { where_clause, .. }) = where_clause(&with_where) else {
+        panic!("expected EXISTS");
+    };
+    assert!(where_clause.is_some());
+}
+
+#[test]
 fn rejects_invalid_syntax() {
     assert!(parse("MATCH (c:Class RETURN c").is_err());
     assert!(parse("RETURN c").is_err());

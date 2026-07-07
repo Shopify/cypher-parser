@@ -109,7 +109,7 @@ impl Parser {
     fn parse_query(&mut self) -> Result<Query, CypherError> {
         let mut clauses = Vec::new();
         loop {
-            if self.at_keyword("MATCH") {
+            if self.at_keyword("MATCH") || self.at_keyword("OPTIONAL") {
                 clauses.push(Clause::Match(self.parse_match_clause()?));
             } else if self.at_keyword("WITH") {
                 clauses.push(Clause::With(self.parse_with_clause()?));
@@ -132,6 +132,7 @@ impl Parser {
     }
 
     fn parse_match_clause(&mut self) -> Result<MatchClause, CypherError> {
+        let optional = self.eat_keyword("OPTIONAL");
         self.expect_keyword("MATCH")?;
         let patterns = self.parse_patterns()?;
         let where_clause = if self.eat_keyword("WHERE") {
@@ -140,6 +141,7 @@ impl Parser {
             None
         };
         Ok(MatchClause {
+            optional,
             patterns,
             where_clause,
         })
@@ -530,6 +532,14 @@ impl Parser {
                 {
                     return Ok(Expr::Literal(self.parse_literal()?));
                 }
+                if name.eq_ignore_ascii_case("EXISTS")
+                    && matches!(
+                        self.tokens.get(self.position + 1).map(|t| &t.kind),
+                        Some(TokenKind::LBrace)
+                    )
+                {
+                    return self.parse_exists();
+                }
                 let followed_by_paren = matches!(
                     self.tokens.get(self.position + 1).map(|t| &t.kind),
                     Some(TokenKind::LParen)
@@ -597,6 +607,23 @@ impl Parser {
 
         self.expect(&TokenKind::RParen, "`)` to close a function call")?;
         Ok(Expr::Function { name, args })
+    }
+
+    fn parse_exists(&mut self) -> Result<Expr, CypherError> {
+        self.position += 1; // EXISTS
+        self.expect(&TokenKind::LBrace, "`{` after EXISTS")?;
+        let _ = self.eat_keyword("MATCH"); // the `MATCH` keyword is optional inside EXISTS
+        let patterns = self.parse_patterns()?;
+        let where_clause = if self.eat_keyword("WHERE") {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        self.expect(&TokenKind::RBrace, "`}` to close an EXISTS subquery")?;
+        Ok(Expr::Exists {
+            patterns,
+            where_clause,
+        })
     }
 
     fn parse_list_literal(&mut self) -> Result<Expr, CypherError> {
