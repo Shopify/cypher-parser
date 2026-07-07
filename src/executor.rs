@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use crate::ast::{
     AggFn, Clause, CmpOp, Direction, Expr, Literal, MatchClause, NodePattern, OrderItem,
@@ -64,6 +65,8 @@ pub fn execute<G: GraphProvider>(graph: &G, query: &Query) -> Result<ResultSet, 
     let executor = Executor {
         graph,
         reverse_cache: RefCell::new(HashMap::new()),
+        in_hoist: RefCell::new(HashMap::new()),
+        pushdown: RefCell::new(HashMap::new()),
     };
     executor.run(query)
 }
@@ -74,6 +77,14 @@ struct Executor<'a, G: GraphProvider> {
     /// undirected traversal. Behind a `RefCell` so pattern matching can run through `&self` (needed
     /// to evaluate `EXISTS` predicates during expression evaluation).
     reverse_cache: ReverseCache<G::NodeId>,
+    /// Per-filter-pass memo of loop-invariant `IN` right-hand-side lists, keyed by the RHS
+    /// expression's address, so `x IN <constant list>` is an O(1) `HashSet` lookup instead of an
+    /// O(list) scan re-evaluated per row. Populated for the duration of a single `filter_rows` pass.
+    in_hoist: RefCell<HashMap<usize, Rc<HashSet<CypherValue>>>>,
+    /// Single-variable WHERE predicates pushed down into candidate generation, keyed by variable
+    /// name, so scans prune before pattern expansion. Set for the duration of a MATCH clause's
+    /// pattern expansion; the full WHERE is still applied afterwards.
+    pushdown: RefCell<HashMap<String, Vec<Expr>>>,
 }
 
 impl<G: GraphProvider> Executor<'_, G> {
@@ -110,14 +121,104 @@ impl<G: GraphProvider> Executor<'_, G> {
         clause: &MatchClause,
         scope: &mut Vec<String>,
     ) -> Result<Vec<Row<G::NodeId>>, CypherError> {
+        // Variables that are constant across the whole pass: if the clause's input is a single row
+        // (e.g. right after `WITH collect(...) AS used`), every variable it binds has the same value
+        // in every row produced below, so `x IN <those vars>` right-hand sides can be hoisted.
+        let constant_vars: HashSet<String> = if rows.len() == 1 {
+            rows[0].keys().cloned().collect()
+        } else {
+            HashSet::new()
+        };
+
+        // Push single-variable predicates down into candidate generation so scans prune before
+        // expansion. The full WHERE still runs afterwards, so this is a safe pre-filter.
+        *self.pushdown.borrow_mut() = build_pushdown(&clause.where_clause);
         for pattern in &clause.patterns {
             rows = self.eval_pattern(rows, pattern)?;
             add_pattern_vars(scope, pattern);
         }
+        self.pushdown.borrow_mut().clear();
+
         if let Some(predicate) = &clause.where_clause {
-            rows = self.filter_rows(rows, predicate)?;
+            rows = self.filter_rows_hoisted(rows, predicate, &constant_vars)?;
         }
         Ok(rows)
+    }
+
+    /// Whether a candidate node satisfies the single-variable predicates pushed down for its
+    /// variable. Best-effort: evaluation errors are ignored here (the full WHERE runs later and
+    /// will surface them), so a node is only pruned when a pushed predicate is definitively false.
+    fn node_passes_pushdown(&self, var: &Option<String>, node: G::NodeId) -> bool {
+        let Some(name) = var else {
+            return true;
+        };
+        let preds = match self.pushdown.borrow().get(name) {
+            Some(preds) => preds.clone(),
+            None => return true,
+        };
+        let mut row = Row::new();
+        row.insert(name.clone(), Binding::Node(node));
+        for predicate in &preds {
+            if let Ok(value) = self.eval_expr(&row, predicate)
+                && !value.is_truthy()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Filters rows by a predicate, first hoisting any loop-invariant `IN` right-hand side (one
+    /// whose variables are all constant across the pass) into a `HashSet` evaluated once.
+    fn filter_rows_hoisted(
+        &self,
+        rows: Vec<Row<G::NodeId>>,
+        predicate: &Expr,
+        constant_vars: &HashSet<String>,
+    ) -> Result<Vec<Row<G::NodeId>>, CypherError> {
+        if constant_vars.is_empty() || rows.is_empty() {
+            return self.filter_rows(rows, predicate);
+        }
+
+        // The constant variables have identical values in every row, so evaluate hoistable RHS
+        // lists against the first row.
+        self.in_hoist.borrow_mut().clear();
+        self.build_in_hoist(predicate, constant_vars, &rows[0])?;
+        let result = self.filter_rows(rows, predicate);
+        self.in_hoist.borrow_mut().clear();
+        result
+    }
+
+    /// Walks a predicate and, for each `expr IN <list>` whose right-hand side references only
+    /// constant variables, evaluates the list once and stores it as a `HashSet` keyed by the RHS
+    /// expression's address.
+    fn build_in_hoist(
+        &self,
+        expr: &Expr,
+        constant_vars: &HashSet<String>,
+        sample: &Row<G::NodeId>,
+    ) -> Result<(), CypherError> {
+        match expr {
+            Expr::Compare(left, CmpOp::In, right) => {
+                self.build_in_hoist(left, constant_vars, sample)?;
+                if references_only(right, constant_vars)
+                    && let CypherValue::List(items) = self.eval_expr(sample, right)?
+                {
+                    let set: HashSet<CypherValue> = items.into_iter().collect();
+                    let key = std::ptr::from_ref::<Expr>(right) as usize;
+                    self.in_hoist.borrow_mut().insert(key, Rc::new(set));
+                }
+            }
+            Expr::Not(inner) | Expr::IsNull(inner, _) => {
+                self.build_in_hoist(inner, constant_vars, sample)?;
+            }
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Compare(a, _, b) => {
+                self.build_in_hoist(a, constant_vars, sample)?;
+                self.build_in_hoist(b, constant_vars, sample)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Runs `OPTIONAL MATCH`: a left join. For each input row, the patterns (and the clause's
@@ -207,6 +308,13 @@ impl<G: GraphProvider> Executor<'_, G> {
         base: Vec<Row<G::NodeId>>,
         pattern: &PathPattern,
     ) -> Result<Vec<Row<G::NodeId>>, CypherError> {
+        // Plan the traversal so it starts from an already-bound endpoint when possible: a
+        // forward-written `(x)-[:R]->(d)` with `d` bound is executed as `(d)<-[:R]-(x)`, walking
+        // through the incoming cache instead of scanning every node as `x`. Reversal yields the
+        // identical set of variable bindings; it only changes traversal direction/cost.
+        let planned = plan_pattern(pattern, base.first());
+        let pattern = &planned;
+
         let mut working: Working<G::NodeId> = Vec::new();
 
         for row in base {
@@ -240,6 +348,7 @@ impl<G: GraphProvider> Executor<'_, G> {
             .scan(&pattern.labels)
             .into_iter()
             .filter(|node| self.props_match(*node, pattern))
+            .filter(|node| self.node_passes_pushdown(&pattern.var, *node))
             .collect()
     }
 
@@ -257,6 +366,9 @@ impl<G: GraphProvider> Executor<'_, G> {
                 self.step_targets(current, &rel_types, rel.direction, rel.length.as_ref());
             for target in targets {
                 if !self.node_matches(target, node) {
+                    continue;
+                }
+                if !self.node_passes_pushdown(&node.var, target) {
                     continue;
                 }
                 // If the target variable is already bound, it must be the same node.
@@ -447,6 +559,16 @@ impl<G: GraphProvider> Executor<'_, G> {
                 self.eval_expr(row, a)?.is_truthy() || self.eval_expr(row, b)?.is_truthy(),
             )),
             Expr::Compare(a, op, b) => {
+                // Fast path: `x IN <hoisted constant list>` becomes an O(1) HashSet membership.
+                if *op == CmpOp::In {
+                    let key = std::ptr::from_ref::<Expr>(b) as usize;
+                    let hoisted = self.in_hoist.borrow().get(&key).cloned();
+                    if let Some(set) = hoisted {
+                        let left = self.eval_expr(row, a)?;
+                        let found = !matches!(left, CypherValue::Null) && set.contains(&left);
+                        return Ok(CypherValue::Bool(found));
+                    }
+                }
                 let left = self.eval_expr(row, a)?;
                 let right = self.eval_expr(row, b)?;
                 Ok(CypherValue::Bool(compare_values(&left, *op, &right)))
@@ -864,6 +986,148 @@ fn resolve_order_column(
     )))
 }
 
+/// Builds the pushdown map: single-variable, aggregate/EXISTS-free `WHERE` conjuncts keyed by the
+/// variable they reference.
+fn build_pushdown(where_clause: &Option<Expr>) -> HashMap<String, Vec<Expr>> {
+    let mut map: HashMap<String, Vec<Expr>> = HashMap::new();
+    if let Some(predicate) = where_clause {
+        let mut conjuncts = Vec::new();
+        collect_conjuncts(predicate, &mut conjuncts);
+        for conjunct in conjuncts {
+            if let Some(var) = single_var(conjunct) {
+                map.entry(var).or_default().push(conjunct.clone());
+            }
+        }
+    }
+    map
+}
+
+/// Flattens a conjunction (`a AND b AND ...`) into its individual conjuncts.
+fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::And(a, b) = expr {
+        collect_conjuncts(a, out);
+        collect_conjuncts(b, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+/// Returns the sole variable an expression references if it is pushable (references exactly one
+/// variable and contains no aggregate or EXISTS subquery); otherwise `None`.
+fn single_var(expr: &Expr) -> Option<String> {
+    let mut vars = HashSet::new();
+    if !collect_vars(expr, &mut vars) {
+        return None;
+    }
+    if vars.len() == 1 {
+        vars.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// Collects the variables referenced by an expression. Returns `false` if the expression contains
+/// an aggregate or EXISTS subquery (not eligible for pushdown).
+fn collect_vars(expr: &Expr, out: &mut HashSet<String>) -> bool {
+    match expr {
+        Expr::Var(name) => {
+            out.insert(name.clone());
+            true
+        }
+        Expr::Property(var, _) => {
+            out.insert(var.clone());
+            true
+        }
+        Expr::Literal(_) => true,
+        Expr::List(items) => items.iter().all(|item| collect_vars(item, out)),
+        Expr::Not(inner) | Expr::IsNull(inner, _) => collect_vars(inner, out),
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Compare(a, _, b) => {
+            let left = collect_vars(a, out);
+            let right = collect_vars(b, out);
+            left && right
+        }
+        Expr::Function { args, .. } => args.iter().all(|arg| collect_vars(arg, out)),
+        Expr::Aggregate { .. } | Expr::Exists { .. } => false,
+    }
+}
+
+/// Whether an expression references only variables in `allowed` (and no aggregates), so it is
+/// constant across a pass in which those variables are constant.
+fn references_only(expr: &Expr, allowed: &HashSet<String>) -> bool {
+    match expr {
+        Expr::Var(name) => allowed.contains(name),
+        Expr::Property(var, _) => allowed.contains(var),
+        Expr::Literal(_) => true,
+        Expr::List(items) => items.iter().all(|item| references_only(item, allowed)),
+        Expr::Not(inner) | Expr::IsNull(inner, _) => references_only(inner, allowed),
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Compare(a, _, b) => {
+            references_only(a, allowed) && references_only(b, allowed)
+        }
+        Expr::Function { args, .. } => args.iter().all(|arg| references_only(arg, allowed)),
+        // Aggregates and existential subqueries are not treated as loop-invariant.
+        Expr::Aggregate { .. } | Expr::Exists { .. } => false,
+    }
+}
+
+/// Chooses a traversal plan for a linear path: if the written start endpoint is not yet bound but
+/// the end endpoint is, return a reversed copy so matching starts from the bound node. Otherwise
+/// the pattern is returned unchanged. Reversal preserves the set of variable bindings exactly.
+fn plan_pattern<N>(pattern: &PathPattern, sample: Option<&Row<N>>) -> PathPattern {
+    if should_reverse(pattern, sample) {
+        reverse_path(pattern)
+    } else {
+        pattern.clone()
+    }
+}
+
+fn should_reverse<N>(pattern: &PathPattern, sample: Option<&Row<N>>) -> bool {
+    let Some((_, end)) = pattern.rest.last() else {
+        return false; // single node: nothing to reverse
+    };
+    let start_bound = is_node_bound(&pattern.start.var, sample);
+    let end_bound = is_node_bound(&end.var, sample);
+    !start_bound && end_bound
+}
+
+fn is_node_bound<N>(var: &Option<String>, sample: Option<&Row<N>>) -> bool {
+    match (var, sample) {
+        (Some(name), Some(row)) => matches!(row.get(name), Some(Binding::Node(_))),
+        _ => false,
+    }
+}
+
+/// Reverses a linear path: walks the node/relationship chain end-to-start and flips each
+/// relationship's direction. The resulting pattern matches the same variable bindings.
+fn reverse_path(pattern: &PathPattern) -> PathPattern {
+    if pattern.rest.is_empty() {
+        return pattern.clone();
+    }
+
+    let mut nodes: Vec<&NodePattern> = Vec::with_capacity(pattern.rest.len() + 1);
+    nodes.push(&pattern.start);
+    for (_, node) in &pattern.rest {
+        nodes.push(node);
+    }
+    let rels: Vec<&crate::ast::RelPattern> = pattern.rest.iter().map(|(rel, _)| rel).collect();
+
+    let start = nodes[nodes.len() - 1].clone();
+    let mut rest = Vec::with_capacity(rels.len());
+    for i in (0..rels.len()).rev() {
+        rest.push((reverse_rel(rels[i]), nodes[i].clone()));
+    }
+    PathPattern { start, rest }
+}
+
+fn reverse_rel(rel: &crate::ast::RelPattern) -> crate::ast::RelPattern {
+    let mut reversed = rel.clone();
+    reversed.direction = match rel.direction {
+        Direction::Outgoing => Direction::Incoming,
+        Direction::Incoming => Direction::Outgoing,
+        Direction::Both => Direction::Both,
+    };
+    reversed
+}
+
 /// Adds the node variables introduced by a pattern to the scope, in declaration order.
 fn add_pattern_vars(scope: &mut Vec<String>, pattern: &PathPattern) {
     let mut push = |var: &Option<String>| {
@@ -954,23 +1218,17 @@ fn string_op(left: &CypherValue, right: &CypherValue, op: impl Fn(&str, &str) ->
 }
 
 fn dedupe_projected<N>(output: &mut Vec<Projected<N>>) {
-    let mut seen: Vec<Vec<CypherValue>> = Vec::new();
-    output.retain(|projected| {
-        if seen.iter().any(|existing| existing == &projected.values) {
-            false
-        } else {
-            seen.push(projected.values.clone());
-            true
-        }
-    });
+    // Order-preserving dedup by projected values. `CypherValue` is `Hash + Eq`, so a `HashSet`
+    // gives O(n) dedup (the old linear scan was O(n^2)).
+    let mut seen: HashSet<Vec<CypherValue>> = HashSet::new();
+    output.retain(|projected| seen.insert(projected.values.clone()));
 }
 
 fn dedupe_values(values: Vec<CypherValue>) -> Vec<CypherValue> {
-    let mut result: Vec<CypherValue> = Vec::new();
-    for value in values {
-        if !result.contains(&value) {
-            result.push(value);
-        }
-    }
-    result
+    // Order-preserving dedup backed by a `HashSet` (was an O(n^2) `contains` scan).
+    let mut seen: HashSet<CypherValue> = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
 }
