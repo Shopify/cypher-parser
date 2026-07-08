@@ -590,6 +590,23 @@ fn negative_literal_comparison() {
 }
 
 #[test]
+fn order_by_cross_type_orderability() {
+    let graph = fixture();
+    // openCypher orderability ascending: string < boolean < number < null.
+    let parsed = parse("UNWIND ['a', true, 1, null] AS x RETURN x ORDER BY x").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![CypherValue::Str("a".into())],
+            vec![CypherValue::Bool(true)],
+            vec![CypherValue::Int(1)],
+            vec![CypherValue::Null],
+        ]
+    );
+}
+
+#[test]
 fn run_query_json() {
     let graph = fixture();
     let output = run_query(

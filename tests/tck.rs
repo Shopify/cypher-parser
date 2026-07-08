@@ -416,6 +416,43 @@ fn conditional2_simple_case_over_integers() {
     }
 }
 
+/// TCK: tck/features/clauses/return-orderby/ReturnOrderBy1.feature
+/// Scenarios [9]/[10] — ORDER BY over lists mixing types and nulls, exercising cross-type
+/// orderability (nulls last, strings before numbers). Now portable after aligning `total_cmp`.
+#[test]
+fn return_order_by_1_lists() {
+    let graph = Graph::default();
+    let query = "UNWIND [[], ['a'], ['a', 1], [1], [1, 'a'], [1, null], [null, 1], [null, 2]] \
+                 AS lists RETURN lists ORDER BY lists";
+
+    let row = |items: Vec<CypherValue>| vec![CypherValue::List(items)];
+    let s = |x: &str| CypherValue::Str(x.to_string());
+    let int = CypherValue::Int;
+    let expected = vec![
+        row(vec![]),
+        row(vec![s("a")]),
+        row(vec![s("a"), int(1)]),
+        row(vec![int(1)]),
+        row(vec![int(1), s("a")]),
+        row(vec![int(1), CypherValue::Null]),
+        row(vec![CypherValue::Null, int(1)]),
+        row(vec![CypherValue::Null, int(2)]),
+    ];
+
+    let asc = execute(&graph, &parse(query).unwrap()).unwrap();
+    assert_eq!(asc.rows, expected);
+
+    // DESC is the exact reverse (all elements are distinct).
+    let desc = execute(
+        &graph,
+        &parse(&query.replace("ORDER BY lists", "ORDER BY lists DESC")).unwrap(),
+    )
+    .unwrap();
+    let mut reversed = expected;
+    reversed.reverse();
+    assert_eq!(desc.rows, reversed);
+}
+
 /// TCK: tck/features/clauses/match/Match1.feature
 /// Scenario: [1] Match non-existent nodes returns empty
 #[test]

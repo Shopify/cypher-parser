@@ -50,21 +50,24 @@ impl CypherValue {
         }
     }
 
-    /// Rank of each variant, used to order values of differing types deterministically.
+    /// Rank of each variant for cross-type ordering, following openCypher orderability:
+    /// `Map < Node < List < String < Boolean < Number < null` (ascending). `null` sorts last;
+    /// strings sort before numbers.
     fn type_rank(&self) -> u8 {
         match self {
-            CypherValue::Null => 0,
-            CypherValue::Bool(_) => 1,
-            CypherValue::Int(_) => 2,
+            CypherValue::Map(_) => 0,
+            CypherValue::Node { .. } => 1,
+            CypherValue::List(_) => 2,
             CypherValue::Str(_) => 3,
-            CypherValue::Node { .. } => 4,
-            CypherValue::List(_) => 5,
-            CypherValue::Map(_) => 6,
+            CypherValue::Bool(_) => 4,
+            CypherValue::Int(_) => 5,
+            CypherValue::Null => 6,
         }
     }
 
-    /// Total ordering across all value types. `NULL` sorts first. Differing types are ordered by
-    /// their variant rank so that sorting is always deterministic.
+    /// Total ordering across all value types, following openCypher orderability. Values of the same
+    /// type are ordered by value; values of differing types by [`Self::type_rank`], so `null` sorts
+    /// last and strings sort before numbers. (Nodes are ordered by name rather than identity.)
     #[must_use]
     pub fn total_cmp(&self, other: &CypherValue) -> Ordering {
         match (self, other) {

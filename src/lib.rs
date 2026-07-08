@@ -31,7 +31,8 @@
 //! - `EXISTS { [MATCH] pattern [WHERE ...] }` existential subquery predicate (and `NOT EXISTS`).
 //! - `CASE` expressions (both `CASE x WHEN ...` and `CASE WHEN cond ...` forms).
 //! - Map projections `n { .prop, key: expr }`.
-//! - `ORDER BY`, `SKIP`, `LIMIT` (on both `WITH` and `RETURN`).
+//! - `ORDER BY`, `SKIP`, `LIMIT` (on both `WITH` and `RETURN`). Ordering follows openCypher
+//!   orderability across types (`null` sorts last; strings sort before numbers).
 //! - Line (`//`) and block (`/* ... */`) comments.
 //! - Negative integer literals (`-10`).
 //!
