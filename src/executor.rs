@@ -35,7 +35,49 @@ impl<N: Copy> Clone for Binding<N> {
 }
 
 /// A single binding row: maps variable names to their bindings.
-type Row<N> = HashMap<String, Binding<N>>;
+///
+/// Backed by a small `Vec` rather than a `HashMap`: rows hold only a handful of variables, so this
+/// is cheaper to allocate and clone (which matters when a scan materializes one row per matched
+/// node) and faster to look up at these sizes.
+struct Row<N> {
+    entries: Vec<(String, Binding<N>)>,
+}
+
+impl<N: Copy> Clone for Row<N> {
+    fn clone(&self) -> Self {
+        Row {
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+impl<N: Copy> Row<N> {
+    fn new() -> Self {
+        Row {
+            entries: Vec::new(),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&Binding<N>> {
+        self.entries
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    }
+
+    /// Binds `key`, overwriting any existing binding for it (preserving map semantics).
+    fn insert(&mut self, key: String, value: Binding<N>) {
+        if let Some(slot) = self.entries.iter_mut().find(|(name, _)| *name == key) {
+            slot.1 = value;
+        } else {
+            self.entries.push((key, value));
+        }
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.entries.iter().map(|(name, _)| name)
+    }
+}
 
 /// A binding row paired with the node most recently matched in the path being expanded.
 type Working<N> = Vec<(Row<N>, N)>;
@@ -1210,7 +1252,7 @@ fn references_only(expr: &Expr, allowed: &HashSet<String>) -> bool {
 /// Chooses a traversal plan for a linear path: if the written start endpoint is not yet bound but
 /// the end endpoint is, return a reversed copy so matching starts from the bound node. Otherwise
 /// the pattern is returned unchanged. Reversal preserves the set of variable bindings exactly.
-fn plan_pattern<N>(pattern: &PathPattern, sample: Option<&Row<N>>) -> PathPattern {
+fn plan_pattern<N: Copy>(pattern: &PathPattern, sample: Option<&Row<N>>) -> PathPattern {
     if should_reverse(pattern, sample) {
         reverse_path(pattern)
     } else {
@@ -1218,7 +1260,7 @@ fn plan_pattern<N>(pattern: &PathPattern, sample: Option<&Row<N>>) -> PathPatter
     }
 }
 
-fn should_reverse<N>(pattern: &PathPattern, sample: Option<&Row<N>>) -> bool {
+fn should_reverse<N: Copy>(pattern: &PathPattern, sample: Option<&Row<N>>) -> bool {
     let Some((_, end)) = pattern.rest.last() else {
         return false; // single node: nothing to reverse
     };
@@ -1227,7 +1269,7 @@ fn should_reverse<N>(pattern: &PathPattern, sample: Option<&Row<N>>) -> bool {
     !start_bound && end_bound
 }
 
-fn is_node_bound<N>(var: &Option<String>, sample: Option<&Row<N>>) -> bool {
+fn is_node_bound<N: Copy>(var: &Option<String>, sample: Option<&Row<N>>) -> bool {
     match (var, sample) {
         (Some(name), Some(row)) => matches!(row.get(name), Some(Binding::Node(_))),
         _ => false,
