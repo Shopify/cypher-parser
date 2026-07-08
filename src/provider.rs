@@ -37,6 +37,22 @@ pub trait GraphProvider {
     /// efficient); returning a tighter set is an optimization.
     fn rel_sources(&self, rel_type: &str) -> Vec<Self::NodeId>;
 
+    /// Returns the incoming neighbours of `node` along `rel_type`: the sources `s` such that
+    /// `s -[rel_type]-> node`.
+    ///
+    /// This is the targeted counterpart to [`Self::expand`] for incoming (and undirected) steps.
+    /// Return `None` if the provider cannot answer directly and wants the executor to fall back to
+    /// building reverse adjacency from [`Self::rel_sources`] + [`Self::expand`] — the default.
+    /// Implementing it (when the backend stores the reverse edge) turns an incoming step from an
+    /// `O(all sources)` whole-graph build into an `O(degree of node)` lookup.
+    ///
+    /// When `Some`, the returned set must equal what the reverse-adjacency build would yield (order
+    /// irrelevant; the executor de-duplicates).
+    fn expand_in(&self, node: Self::NodeId, rel_type: &str) -> Option<Vec<Self::NodeId>> {
+        let _ = (node, rel_type);
+        None
+    }
+
     /// Returns the value of property `prop` on `node`, or [`CypherValue::Null`] if it is absent.
     fn property(&self, node: Self::NodeId, prop: &str) -> CypherValue;
 

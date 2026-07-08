@@ -469,6 +469,12 @@ impl<G: GraphProvider> Executor<'_, G> {
     }
 
     fn incoming(&self, node: G::NodeId, rel: &str) -> Vec<G::NodeId> {
+        // Fast path: ask the provider for this node's incoming neighbours directly. Avoids the
+        // whole-graph reverse-adjacency build below.
+        if let Some(sources) = self.graph.expand_in(node, rel) {
+            return sources;
+        }
+
         if !self.reverse_cache.borrow().contains_key(rel) {
             let mut reverse: HashMap<G::NodeId, Vec<G::NodeId>> = HashMap::new();
             for source in self.graph.rel_sources(rel) {
