@@ -54,6 +54,11 @@ impl GraphProvider for MyGraph {
 let output = run_query(&my_graph, "MATCH (n:Class) RETURN n.name", OutputFormat::Json)?;
 ```
 
+Providers may also implement the optional `expand_in` method to answer incoming-neighbour queries
+directly; it makes incoming and undirected relationship steps `O(degree)` instead of building a
+whole-graph reverse-adjacency map. It defaults to `None` (fall back to the reverse build), so it is
+never required.
+
 ## Supported subset
 
 - **`MATCH`** — node patterns `(v:Label {prop: value})` with label disjunction (`(v:A|B)`); relationship
@@ -85,11 +90,11 @@ Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) are intentionally u
 - `OutputFormat` / `CypherValue` — result formatting and values.
 - `ast` — the AST types; `CypherError` — lexing/parsing/execution errors with a source position.
 
-## Roadmap
+## Not yet supported
 
-Planned syntax additions (multi-label `AND`, floats/arithmetic, `=~` regex, parameters, `UNION`,
-relationship-variable `RETURN`, …) and their prioritized implementation plans are in
-[docs/ROADMAP.md](docs/ROADMAP.md) (with a quick [docs/CHECKLIST.md](docs/CHECKLIST.md)).
+Planned syntax additions include multi-label `AND` (`(n:A:B)`), floats and arithmetic, `=~` regex
+matching, query parameters (`$name`), `UNION`, and relationship-variable `RETURN`. Write clauses
+remain out of scope.
 
 ## Contributing
 
