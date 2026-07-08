@@ -327,6 +327,34 @@ fn parses_map_projection() {
 }
 
 #[test]
+fn parses_negative_literals() {
+    // In a WHERE comparison.
+    let query = parse("MATCH (c) WHERE c.line > -1 RETURN c").unwrap();
+    let Some(Expr::Compare(_, _, right)) = where_clause(&query) else {
+        panic!("expected comparison");
+    };
+    assert_eq!(*right, Expr::Literal(Literal::Int(-1)));
+
+    // In an inline node property map.
+    let props = parse("MATCH (c {line: -5}) RETURN c").unwrap();
+    assert_eq!(patterns(&props)[0].start.props[0].1, Literal::Int(-5));
+
+    // In a list literal.
+    let list = parse("UNWIND [-1, -2, 3] AS x RETURN x").unwrap();
+    let Some(Clause::Unwind(u)) = list.clauses.first() else {
+        panic!("expected UNWIND");
+    };
+    assert_eq!(
+        u.expr,
+        Expr::List(vec![
+            Expr::Literal(Literal::Int(-1)),
+            Expr::Literal(Literal::Int(-2)),
+            Expr::Literal(Literal::Int(3)),
+        ])
+    );
+}
+
+#[test]
 fn rejects_invalid_syntax() {
     assert!(parse("MATCH (c:Class RETURN c").is_err());
     assert!(parse("RETURN c").is_err());

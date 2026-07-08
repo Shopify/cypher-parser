@@ -581,6 +581,15 @@ fn map_projection_builds_map() {
 }
 
 #[test]
+fn negative_literal_comparison() {
+    let graph = fixture();
+    let parsed = parse("UNWIND [-5, -1, 3] AS x WITH x WHERE x > -2 RETURN x").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    let got: Vec<i64> = result.rows.iter().map(|r| r[0].as_int().unwrap()).collect();
+    assert_eq!(got, vec![-1, 3]);
+}
+
+#[test]
 fn run_query_json() {
     let graph = fixture();
     let output = run_query(

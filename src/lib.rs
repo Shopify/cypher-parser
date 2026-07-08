@@ -33,6 +33,7 @@
 //! - Map projections `n { .prop, key: expr }`.
 //! - `ORDER BY`, `SKIP`, `LIMIT` (on both `WITH` and `RETURN`).
 //! - Line (`//`) and block (`/* ... */`) comments.
+//! - Negative integer literals (`-10`).
 //!
 //! Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, …) are intentionally not supported.
 //!

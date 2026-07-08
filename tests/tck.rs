@@ -379,6 +379,43 @@ fn return_order_by_1_homogeneous() {
     }
 }
 
+/// TCK: tck/features/expressions/conditional/Conditional2.feature
+/// Scenario Outline: [1] Simple cases over integers.
+///
+/// Adapted: the TCK writes `RETURN CASE <value> ...` with no reading clause; this crate requires
+/// one, so each example is wrapped as `UNWIND [<value>] AS v RETURN CASE v ...`. The `10.1` example
+/// is omitted (floats unsupported). CASE branches and expected results are verbatim.
+#[test]
+fn conditional2_simple_case_over_integers() {
+    let graph = Graph::default();
+    let case = "CASE v WHEN -10 THEN 'minus ten' WHEN 0 THEN 'zero' WHEN 1 THEN 'one' \
+                WHEN 5 THEN 'five' WHEN 10 THEN 'ten' WHEN 3000 THEN 'three thousand' \
+                ELSE 'something else' END";
+
+    let cases: &[(&str, &str)] = &[
+        ("-10", "minus ten"),
+        ("0", "zero"),
+        ("1", "one"),
+        ("5", "five"),
+        ("10", "ten"),
+        ("3000", "three thousand"),
+        ("-30", "something else"),
+        ("3", "something else"),
+        ("3001", "something else"),
+        ("'0'", "something else"),
+        ("true", "something else"),
+    ];
+
+    for (value, expected) in cases {
+        let query = format!("UNWIND [{value}] AS v RETURN {case} AS result");
+        assert_eq!(
+            column_in_order(&graph, &query, 0),
+            vec![(*expected).to_string()],
+            "value {value}"
+        );
+    }
+}
+
 /// TCK: tck/features/clauses/match/Match1.feature
 /// Scenario: [1] Match non-existent nodes returns empty
 #[test]

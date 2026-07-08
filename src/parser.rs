@@ -533,6 +533,7 @@ impl Parser {
                 Ok(expr)
             }
             Some(TokenKind::LBracket) => self.parse_list_literal(),
+            Some(TokenKind::Minus) => Ok(Expr::Literal(self.parse_literal()?)),
             Some(TokenKind::Str(_) | TokenKind::Int(_)) => Ok(Expr::Literal(self.parse_literal()?)),
             Some(TokenKind::Ident(name)) => {
                 let name = name.clone();
@@ -734,6 +735,17 @@ impl Parser {
                 kind: TokenKind::Int(value),
                 ..
             }) => Ok(Literal::Int(value)),
+            // Unary minus on a numeric literal, e.g. `-10`.
+            Some(Token {
+                kind: TokenKind::Minus,
+                position,
+            }) => match self.advance() {
+                Some(Token {
+                    kind: TokenKind::Int(value),
+                    ..
+                }) => Ok(Literal::Int(-value)),
+                _ => Err(CypherError::syntax("expected a number after `-`", position)),
+            },
             Some(Token {
                 kind: TokenKind::Ident(name),
                 position,

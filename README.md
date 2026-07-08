@@ -72,6 +72,7 @@ let output = run_query(&my_graph, "MATCH (n:Class) RETURN n.name", OutputFormat:
 - **Map projections** — `n { .prop, key: expr }`.
 - **`ORDER BY`**, **`SKIP`**, **`LIMIT`** (on both `WITH` and `RETURN`).
 - **Comments** — line (`//`) and block (`/* ... */`).
+- **Negative integer literals** — `-10`.
 
 Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) are intentionally unsupported.
 
