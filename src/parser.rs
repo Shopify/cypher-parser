@@ -1,6 +1,6 @@
 use crate::ast::{
-    AggFn, Clause, CmpOp, Direction, Expr, Literal, MatchClause, NodePattern, OrderItem,
-    PathPattern, Projection, Query, RelPattern, ReturnItem, VarLength, WithClause,
+    AggFn, Clause, CmpOp, Direction, Expr, Literal, MapEntry, MatchClause, NodePattern, OrderItem,
+    PathPattern, Projection, Query, RelPattern, ReturnItem, UnwindClause, VarLength, WithClause,
 };
 use crate::error::CypherError;
 use crate::lexer::{Token, TokenKind, tokenize};
@@ -111,6 +111,8 @@ impl Parser {
         loop {
             if self.at_keyword("MATCH") || self.at_keyword("OPTIONAL") {
                 clauses.push(Clause::Match(self.parse_match_clause()?));
+            } else if self.at_keyword("UNWIND") {
+                clauses.push(Clause::Unwind(self.parse_unwind_clause()?));
             } else if self.at_keyword("WITH") {
                 clauses.push(Clause::With(self.parse_with_clause()?));
             } else {
@@ -145,6 +147,14 @@ impl Parser {
             patterns,
             where_clause,
         })
+    }
+
+    fn parse_unwind_clause(&mut self) -> Result<UnwindClause, CypherError> {
+        self.expect_keyword("UNWIND")?;
+        let expr = self.parse_expr()?;
+        self.expect_keyword("AS")?;
+        let var = self.expect_ident("a variable name after `AS`")?;
+        Ok(UnwindClause { expr, var })
     }
 
     fn parse_with_clause(&mut self) -> Result<WithClause, CypherError> {
@@ -540,6 +550,9 @@ impl Parser {
                 {
                     return self.parse_exists();
                 }
+                if name.eq_ignore_ascii_case("CASE") {
+                    return self.parse_case();
+                }
                 let followed_by_paren = matches!(
                     self.tokens.get(self.position + 1).map(|t| &t.kind),
                     Some(TokenKind::LParen)
@@ -555,6 +568,8 @@ impl Parser {
                     self.position += 1;
                     let prop = self.expect_ident("a property name after `.`")?;
                     Ok(Expr::Property(name, prop))
+                } else if matches!(self.peek_kind(), Some(TokenKind::LBrace)) {
+                    self.parse_map_projection(name)
                 } else {
                     Ok(Expr::Var(name))
                 }
@@ -609,6 +624,44 @@ impl Parser {
         Ok(Expr::Function { name, args })
     }
 
+    fn parse_case(&mut self) -> Result<Expr, CypherError> {
+        self.expect_keyword("CASE")?;
+
+        // Simple form has an operand between CASE and the first WHEN.
+        let operand = if self.at_keyword("WHEN") {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+
+        let mut branches = Vec::new();
+        while self.eat_keyword("WHEN") {
+            let when = self.parse_expr()?;
+            self.expect_keyword("THEN")?;
+            let then = self.parse_expr()?;
+            branches.push((when, then));
+        }
+        if branches.is_empty() {
+            return Err(CypherError::syntax(
+                "expected at least one `WHEN` in CASE",
+                self.current_position(),
+            ));
+        }
+
+        let default = if self.eat_keyword("ELSE") {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+
+        self.expect_keyword("END")?;
+        Ok(Expr::Case {
+            operand,
+            branches,
+            default,
+        })
+    }
+
     fn parse_exists(&mut self) -> Result<Expr, CypherError> {
         self.position += 1; // EXISTS
         self.expect(&TokenKind::LBrace, "`{` after EXISTS")?;
@@ -624,6 +677,35 @@ impl Parser {
             patterns,
             where_clause,
         })
+    }
+
+    fn parse_map_projection(&mut self, var: String) -> Result<Expr, CypherError> {
+        self.expect(&TokenKind::LBrace, "`{` to start a map projection")?;
+
+        let mut entries = Vec::new();
+        if !matches!(self.peek_kind(), Some(TokenKind::RBrace)) {
+            loop {
+                if matches!(self.peek_kind(), Some(TokenKind::Dot)) {
+                    self.position += 1;
+                    let prop = self.expect_ident("a property name after `.`")?;
+                    entries.push(MapEntry::Property(prop));
+                } else {
+                    let key = self.expect_ident("a map key or `.property`")?;
+                    self.expect(&TokenKind::Colon, "`:` after a map key")?;
+                    let value = self.parse_expr()?;
+                    entries.push(MapEntry::Literal(key, value));
+                }
+
+                if matches!(self.peek_kind(), Some(TokenKind::Comma)) {
+                    self.position += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        self.expect(&TokenKind::RBrace, "`}` to close a map projection")?;
+        Ok(Expr::MapProjection { var, entries })
     }
 
     fn parse_list_literal(&mut self) -> Result<Expr, CypherError> {

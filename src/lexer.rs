@@ -63,6 +63,32 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, CypherError> {
             ',' => push(&mut tokens, TokenKind::Comma, start, &mut index),
             ':' => push(&mut tokens, TokenKind::Colon, start, &mut index),
             '*' => push(&mut tokens, TokenKind::Star, start, &mut index),
+            '/' => match chars.get(index + 1) {
+                // Line comment: skip to end of line.
+                Some('/') => {
+                    index += 2;
+                    while index < chars.len() && chars[index] != '\n' {
+                        index += 1;
+                    }
+                }
+                // Block comment: skip to the closing `*/`.
+                Some('*') => {
+                    index += 2;
+                    loop {
+                        if index >= chars.len() {
+                            return Err(CypherError::syntax("unterminated block comment", start));
+                        }
+                        if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                _ => {
+                    return Err(CypherError::syntax("unexpected character `/`", start));
+                }
+            },
             '|' => push(&mut tokens, TokenKind::Pipe, start, &mut index),
             '-' => push(&mut tokens, TokenKind::Minus, start, &mut index),
             '=' => push(&mut tokens, TokenKind::Eq, start, &mut index),

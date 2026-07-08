@@ -66,8 +66,12 @@ let output = run_query(&my_graph, "MATCH (n:Class) RETURN n.name", OutputFormat:
 - **`WITH`** — chain clauses by projecting into new bindings (same features as `RETURN`, including
   aggregates) with an optional trailing `WHERE`, e.g. `MATCH ... WITH n, count(*) AS c WHERE c > 1`.
 - **`OPTIONAL MATCH`** — left join; unmatched rows are kept with the clause's new variables null.
+- **`UNWIND <list> AS x`** — expand a list into rows.
 - **`EXISTS { [MATCH] pattern [WHERE ...] }`** — existential subquery predicate, and `NOT EXISTS`.
+- **`CASE`** — both `CASE x WHEN v THEN ...` and `CASE WHEN cond THEN ...` forms.
+- **Map projections** — `n { .prop, key: expr }`.
 - **`ORDER BY`**, **`SKIP`**, **`LIMIT`** (on both `WITH` and `RETURN`).
+- **Comments** — line (`//`) and block (`/* ... */`).
 
 Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) are intentionally unsupported.
 
@@ -82,9 +86,9 @@ Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`) are intentionally u
 
 ## Roadmap
 
-Planned syntax additions (multi-label `AND`, floats/arithmetic, `UNWIND`, `CASE`, …) and their
-prioritized implementation plans are in [docs/ROADMAP.md](docs/ROADMAP.md) (with a quick
-[docs/CHECKLIST.md](docs/CHECKLIST.md)).
+Planned syntax additions (multi-label `AND`, floats/arithmetic, `=~` regex, parameters, `UNION`,
+relationship-variable `RETURN`, …) and their prioritized implementation plans are in
+[docs/ROADMAP.md](docs/ROADMAP.md) (with a quick [docs/CHECKLIST.md](docs/CHECKLIST.md)).
 
 ## Contributing
 

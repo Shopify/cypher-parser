@@ -271,6 +271,62 @@ fn parses_exists_predicate() {
 }
 
 #[test]
+fn parses_unwind() {
+    let query = parse("UNWIND [1, 2, 3] AS x RETURN x").unwrap();
+    assert_eq!(query.clauses.len(), 1);
+    let Some(Clause::Unwind(u)) = query.clauses.first() else {
+        panic!("expected UNWIND");
+    };
+    assert_eq!(u.var, "x");
+    assert!(matches!(u.expr, Expr::List(_)));
+}
+
+#[test]
+fn parses_case_expressions() {
+    let generic = parse("MATCH (c) RETURN CASE WHEN c.name = 'Dog' THEN 1 ELSE 0 END").unwrap();
+    let Expr::Case {
+        operand,
+        branches,
+        default,
+    } = &generic.result.items[0].expr
+    else {
+        panic!("expected CASE");
+    };
+    assert!(operand.is_none());
+    assert_eq!(branches.len(), 1);
+    assert!(default.is_some());
+
+    let simple = parse("MATCH (c) RETURN CASE c.name WHEN 'Dog' THEN 1 END").unwrap();
+    let Expr::Case {
+        operand, default, ..
+    } = &simple.result.items[0].expr
+    else {
+        panic!("expected CASE");
+    };
+    assert!(operand.is_some());
+    assert!(default.is_none());
+}
+
+#[test]
+fn parses_comments() {
+    let query =
+        parse("MATCH (c:Class) // find classes\n WHERE c.name = 'Dog' /* inline */ RETURN c")
+            .unwrap();
+    assert_eq!(patterns(&query).len(), 1);
+    assert!(where_clause(&query).is_some());
+}
+
+#[test]
+fn parses_map_projection() {
+    let query = parse("MATCH (c) RETURN c { .name, kind: 'x' }").unwrap();
+    let Expr::MapProjection { var, entries } = &query.result.items[0].expr else {
+        panic!("expected map projection");
+    };
+    assert_eq!(var, "c");
+    assert_eq!(entries.len(), 2);
+}
+
+#[test]
 fn rejects_invalid_syntax() {
     assert!(parse("MATCH (c:Class RETURN c").is_err());
     assert!(parse("RETURN c").is_err());

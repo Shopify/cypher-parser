@@ -27,8 +27,12 @@
 //!   into a new set of bindings, with an optional trailing `WHERE` — enabling post-aggregation
 //!   filtering such as `MATCH ... WITH n, count(*) AS c WHERE c > 1 RETURN ...`.
 //! - `OPTIONAL MATCH` (left join: unmatched rows are kept with the clause's new variables null).
+//! - `UNWIND <list> AS x` to expand a list into rows.
 //! - `EXISTS { [MATCH] pattern [WHERE ...] }` existential subquery predicate (and `NOT EXISTS`).
+//! - `CASE` expressions (both `CASE x WHEN ...` and `CASE WHEN cond ...` forms).
+//! - Map projections `n { .prop, key: expr }`.
 //! - `ORDER BY`, `SKIP`, `LIMIT` (on both `WITH` and `RETURN`).
+//! - Line (`//`) and block (`/* ... */`) comments.
 //!
 //! Write clauses (`CREATE`, `MERGE`, `SET`, `DELETE`, …) are intentionally not supported.
 //!

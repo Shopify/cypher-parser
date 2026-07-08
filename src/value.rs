@@ -16,6 +16,8 @@ pub enum CypherValue {
         name: String,
     },
     List(Vec<CypherValue>),
+    /// An ordered map, e.g. from a map projection `n { .name, k: expr }`.
+    Map(Vec<(String, CypherValue)>),
 }
 
 impl CypherValue {
@@ -57,6 +59,7 @@ impl CypherValue {
             CypherValue::Str(_) => 3,
             CypherValue::Node { .. } => 4,
             CypherValue::List(_) => 5,
+            CypherValue::Map(_) => 6,
         }
     }
 
@@ -72,6 +75,15 @@ impl CypherValue {
             (CypherValue::List(a), CypherValue::List(b)) => {
                 for (x, y) in a.iter().zip(b.iter()) {
                     let ordering = x.total_cmp(y);
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            (CypherValue::Map(a), CypherValue::Map(b)) => {
+                for ((ak, av), (bk, bv)) in a.iter().zip(b.iter()) {
+                    let ordering = ak.cmp(bk).then_with(|| av.total_cmp(bv));
                     if ordering != Ordering::Equal {
                         return ordering;
                     }
@@ -95,6 +107,13 @@ impl CypherValue {
                 let rendered: Vec<String> =
                     items.iter().map(CypherValue::to_display_string).collect();
                 format!("[{}]", rendered.join(", "))
+            }
+            CypherValue::Map(entries) => {
+                let rendered: Vec<String> = entries
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {}", value.to_display_string()))
+                    .collect();
+                format!("{{{}}}", rendered.join(", "))
             }
         }
     }
@@ -126,6 +145,18 @@ impl CypherValue {
                     item.write_json(out);
                 }
                 out.push(']');
+            }
+            CypherValue::Map(entries) => {
+                out.push('{');
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    write_json_string(out, key);
+                    out.push(':');
+                    value.write_json(out);
+                }
+                out.push('}');
             }
         }
     }

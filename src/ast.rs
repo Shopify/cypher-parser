@@ -14,7 +14,15 @@ pub struct Query {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Clause {
     Match(MatchClause),
+    Unwind(UnwindClause),
     With(WithClause),
+}
+
+/// An `UNWIND <expr> AS <var>` clause: expands a list value into one row per element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwindClause {
+    pub expr: Expr,
+    pub var: String,
 }
 
 /// A `MATCH` clause: comma-separated path patterns with an optional `WHERE` filter.
@@ -151,10 +159,22 @@ pub enum Expr {
         patterns: Vec<PathPattern>,
         where_clause: Option<Box<Expr>>,
     },
+    /// A `CASE` expression. `operand` is `Some` for the simple form (`CASE x WHEN v THEN ...`),
+    /// `None` for the generic form (`CASE WHEN cond THEN ...`). Each branch is `(when, then)`.
+    Case {
+        operand: Option<Box<Expr>>,
+        branches: Vec<(Expr, Expr)>,
+        default: Option<Box<Expr>>,
+    },
     /// A scalar function call such as `toLower(c.name)` or `coalesce(a, b)`.
     Function {
         name: String,
         args: Vec<Expr>,
+    },
+    /// A map projection `var { .prop, key: expr }` producing a map value.
+    MapProjection {
+        var: String,
+        entries: Vec<MapEntry>,
     },
     Aggregate {
         func: AggFn,
@@ -175,6 +195,21 @@ impl Expr {
             Expr::Compare(a, _, b) => a.contains_aggregate() || b.contains_aggregate(),
             Expr::List(items) => items.iter().any(Expr::contains_aggregate),
             Expr::Function { args, .. } => args.iter().any(Expr::contains_aggregate),
+            Expr::MapProjection { entries, .. } => entries.iter().any(|entry| match entry {
+                MapEntry::Property(_) => false,
+                MapEntry::Literal(_, expr) => expr.contains_aggregate(),
+            }),
+            Expr::Case {
+                operand,
+                branches,
+                default,
+            } => {
+                operand.as_ref().is_some_and(|o| o.contains_aggregate())
+                    || branches
+                        .iter()
+                        .any(|(w, t)| w.contains_aggregate() || t.contains_aggregate())
+                    || default.as_ref().is_some_and(|d| d.contains_aggregate())
+            }
             // An EXISTS subquery is an opaque boolean; aggregates inside it do not affect the
             // outer projection's grouping.
             Expr::Var(_) | Expr::Property(..) | Expr::Literal(_) | Expr::Exists { .. } => false,
@@ -202,6 +237,8 @@ impl Expr {
                 format!("{} IS{not} NULL", inner.display_name())
             }
             Expr::Exists { .. } => "EXISTS { ... }".to_string(),
+            Expr::Case { .. } => "CASE ... END".to_string(),
+            Expr::MapProjection { var, .. } => format!("{var} {{ ... }}"),
             Expr::Function { name, args } => {
                 let inner: Vec<String> = args.iter().map(Expr::display_name).collect();
                 format!("{name}({})", inner.join(", "))
@@ -226,6 +263,15 @@ impl Expr {
             }
         }
     }
+}
+
+/// An entry in a map projection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MapEntry {
+    /// `.prop` — take property `prop` of the projected node, under key `prop`.
+    Property(String),
+    /// `key: expr` — an explicit key with a computed value.
+    Literal(String, Expr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::ast::{
     AggFn, Clause, CmpOp, Direction, Expr, Literal, MatchClause, NodePattern, OrderItem,
-    PathPattern, Projection, Query, ReturnItem, WithClause,
+    PathPattern, Projection, Query, ReturnItem, UnwindClause, WithClause,
 };
 use crate::error::CypherError;
 use crate::provider::GraphProvider;
@@ -98,6 +98,12 @@ impl<G: GraphProvider> Executor<'_, G> {
                     rows = self.run_optional_match(rows, m, &mut scope)?;
                 }
                 Clause::Match(m) => rows = self.run_match(rows, m, &mut scope)?,
+                Clause::Unwind(u) => {
+                    rows = self.run_unwind(rows, u)?;
+                    if !scope.contains(&u.var) {
+                        scope.push(u.var.clone());
+                    }
+                }
                 Clause::With(w) => {
                     let (columns, rows_after) = self.run_with(&rows, w, &scope)?;
                     rows = rows_after;
@@ -219,6 +225,32 @@ impl<G: GraphProvider> Executor<'_, G> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Runs `UNWIND <expr> AS var`: for each input row, evaluates the list and emits one output row
+    /// per element with `var` bound to it. A null list yields no rows; a non-list is an error.
+    fn run_unwind(
+        &self,
+        rows: Vec<Row<G::NodeId>>,
+        clause: &UnwindClause,
+    ) -> Result<Vec<Row<G::NodeId>>, CypherError> {
+        let mut output = Vec::new();
+        for row in rows {
+            match self.eval_expr(&row, &clause.expr)? {
+                CypherValue::List(items) => {
+                    for item in items {
+                        let mut new_row = row.clone();
+                        new_row.insert(clause.var.clone(), Binding::Value(item));
+                        output.push(new_row);
+                    }
+                }
+                CypherValue::Null => {}
+                _ => {
+                    return Err(CypherError::execution("UNWIND expects a list"));
+                }
+            }
+        }
+        Ok(output)
     }
 
     /// Runs `OPTIONAL MATCH`: a left join. For each input row, the patterns (and the clause's
@@ -597,10 +629,72 @@ impl<G: GraphProvider> Executor<'_, G> {
                 }
                 Ok(CypherValue::Bool(!rows.is_empty()))
             }
+            Expr::Case {
+                operand,
+                branches,
+                default,
+            } => self.eval_case(row, operand.as_deref(), branches, default.as_deref()),
             Expr::Function { name, args } => self.eval_function(row, name, args),
+            Expr::MapProjection { var, entries } => self.eval_map_projection(row, var, entries),
             Expr::Aggregate { .. } => Err(CypherError::execution(
                 "aggregate functions are only allowed in WITH or RETURN projections",
             )),
+        }
+    }
+
+    fn eval_map_projection(
+        &self,
+        row: &Row<G::NodeId>,
+        var: &str,
+        entries: &[crate::ast::MapEntry],
+    ) -> Result<CypherValue, CypherError> {
+        // A map projection is defined over a node; on a null/non-node binding it yields null.
+        let node = match row.get(var) {
+            Some(Binding::Node(node)) => *node,
+            _ => return Ok(CypherValue::Null),
+        };
+
+        let mut map = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                crate::ast::MapEntry::Property(prop) => {
+                    map.push((prop.clone(), self.graph.property(node, prop)));
+                }
+                crate::ast::MapEntry::Literal(key, expr) => {
+                    map.push((key.clone(), self.eval_expr(row, expr)?));
+                }
+            }
+        }
+        Ok(CypherValue::Map(map))
+    }
+
+    fn eval_case(
+        &self,
+        row: &Row<G::NodeId>,
+        operand: Option<&Expr>,
+        branches: &[(Expr, Expr)],
+        default: Option<&Expr>,
+    ) -> Result<CypherValue, CypherError> {
+        if let Some(operand) = operand {
+            // Simple form: compare the operand against each WHEN value.
+            let subject = self.eval_expr(row, operand)?;
+            for (when, then) in branches {
+                let candidate = self.eval_expr(row, when)?;
+                if values_equal(&subject, &candidate) {
+                    return self.eval_expr(row, then);
+                }
+            }
+        } else {
+            // Generic form: the first truthy WHEN condition wins.
+            for (when, then) in branches {
+                if self.eval_expr(row, when)?.is_truthy() {
+                    return self.eval_expr(row, then);
+                }
+            }
+        }
+        match default {
+            Some(default) => self.eval_expr(row, default),
+            None => Ok(CypherValue::Null),
         }
     }
 
@@ -1047,6 +1141,26 @@ fn collect_vars(expr: &Expr, out: &mut HashSet<String>) -> bool {
             left && right
         }
         Expr::Function { args, .. } => args.iter().all(|arg| collect_vars(arg, out)),
+        Expr::MapProjection { var, entries } => {
+            out.insert(var.clone());
+            entries.iter().all(|entry| match entry {
+                crate::ast::MapEntry::Property(_) => true,
+                crate::ast::MapEntry::Literal(_, expr) => collect_vars(expr, out),
+            })
+        }
+        Expr::Case {
+            operand,
+            branches,
+            default,
+        } => {
+            let mut ok = operand.as_ref().is_none_or(|o| collect_vars(o, out));
+            for (when, then) in branches {
+                ok = collect_vars(when, out) && ok;
+                ok = collect_vars(then, out) && ok;
+            }
+            ok = default.as_ref().is_none_or(|d| collect_vars(d, out)) && ok;
+            ok
+        }
         Expr::Aggregate { .. } | Expr::Exists { .. } => false,
     }
 }
@@ -1064,6 +1178,24 @@ fn references_only(expr: &Expr, allowed: &HashSet<String>) -> bool {
             references_only(a, allowed) && references_only(b, allowed)
         }
         Expr::Function { args, .. } => args.iter().all(|arg| references_only(arg, allowed)),
+        Expr::MapProjection { var, entries } => {
+            allowed.contains(var)
+                && entries.iter().all(|entry| match entry {
+                    crate::ast::MapEntry::Property(_) => true,
+                    crate::ast::MapEntry::Literal(_, expr) => references_only(expr, allowed),
+                })
+        }
+        Expr::Case {
+            operand,
+            branches,
+            default,
+        } => {
+            operand.as_ref().is_none_or(|o| references_only(o, allowed))
+                && branches
+                    .iter()
+                    .all(|(w, t)| references_only(w, allowed) && references_only(t, allowed))
+                && default.as_ref().is_none_or(|d| references_only(d, allowed))
+        }
         // Aggregates and existential subqueries are not treated as loop-invariant.
         Expr::Aggregate { .. } | Expr::Exists { .. } => false,
     }
@@ -1207,6 +1339,7 @@ fn same_type(left: &CypherValue, right: &CypherValue) -> bool {
             | (CypherValue::Str(_), CypherValue::Str(_))
             | (CypherValue::Node { .. }, CypherValue::Node { .. })
             | (CypherValue::List(_), CypherValue::List(_))
+            | (CypherValue::Map(_), CypherValue::Map(_))
     )
 }
 

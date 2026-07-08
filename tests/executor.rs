@@ -513,6 +513,74 @@ fn exists_predicate_with_inner_where() {
 }
 
 #[test]
+fn unwind_expands_list() {
+    let graph = fixture();
+    let parsed = parse("UNWIND [1, 2, 3] AS x RETURN x").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    let got: Vec<i64> = result.rows.iter().map(|r| r[0].as_int().unwrap()).collect();
+    assert_eq!(got, vec![1, 2, 3]);
+}
+
+#[test]
+fn unwind_after_match_is_cross_product() {
+    let graph = fixture();
+    // 3 classes x 2 elements = 6 rows.
+    let parsed = parse("MATCH (c:Class) UNWIND [1, 2] AS n RETURN c.name, n").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(result.rows.len(), 6);
+}
+
+#[test]
+fn case_expression() {
+    let graph = fixture();
+    let parsed =
+        parse("MATCH (c:Class) RETURN c.name, CASE c.name WHEN 'Dog' THEN 'woof' ELSE '?' END")
+            .unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+
+    let dog = result
+        .rows
+        .iter()
+        .find(|r| r[0] == CypherValue::Str("Dog".into()))
+        .unwrap();
+    assert_eq!(dog[1], CypherValue::Str("woof".into()));
+
+    let animal = result
+        .rows
+        .iter()
+        .find(|r| r[0] == CypherValue::Str("Animal".into()))
+        .unwrap();
+    assert_eq!(animal[1], CypherValue::Str("?".into()));
+}
+
+#[test]
+fn comments_are_ignored() {
+    let graph = fixture();
+    assert_eq!(
+        column(
+            &graph,
+            "MATCH (c:Class) // only dogs\n WHERE c.name = 'Dog' /* comment */ RETURN c.name",
+            0
+        ),
+        vec!["Dog".to_string()]
+    );
+}
+
+#[test]
+fn map_projection_builds_map() {
+    let graph = fixture();
+    let parsed = parse("MATCH (c:Class {name: 'Dog'}) RETURN c { .name, kind: 'class' }").unwrap();
+    let result = execute(&graph, &parsed).unwrap();
+    assert_eq!(
+        result.rows[0][0],
+        CypherValue::Map(vec![
+            ("name".to_string(), CypherValue::Str("Dog".into())),
+            ("kind".to_string(), CypherValue::Str("class".into())),
+        ])
+    );
+}
+
+#[test]
 fn run_query_json() {
     let graph = fixture();
     let output = run_query(
