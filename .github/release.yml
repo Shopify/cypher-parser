@@ -1,0 +1,24 @@
+# Groups pull requests into sections in the auto-generated release notes
+# (Release workflow runs `gh release create --generate-notes`).
+changelog:
+  categories:
+    - title: Breaking Changes
+      labels:
+        - breaking
+    - title: Features
+      labels:
+        - feature
+        - enhancement
+    - title: Performance
+      labels:
+        - performance
+    - title: Fixes
+      labels:
+        - bug
+        - fix
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other Changes
+      labels:
+        - "*"
