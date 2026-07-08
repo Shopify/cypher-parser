@@ -10,6 +10,8 @@ repository = "https://github.com/Shopify/cypher-parser"
 readme = "README.md"
 keywords = ["cypher", "parser", "graph", "query", "opencypher"]
 categories = ["parser-implementations"]
+# Agent/contributor guidance; not part of the published library.
+exclude = ["AGENTS.md"]
 
 # Standalone workspace root so the crate is never absorbed by a parent workspace.
 [workspace]
