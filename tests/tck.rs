@@ -191,6 +191,22 @@ fn sorted(values: &[&str]) -> Vec<String> {
     v
 }
 
+/// Runs a query and returns one column's values in result order (for `Then the result should be,
+/// in order:` scenarios). Does not sort.
+fn column_in_order(graph: &Graph, query: &str, col: usize) -> Vec<String> {
+    let parsed = parse(query).unwrap();
+    let result = execute(graph, &parsed).unwrap();
+    result
+        .rows
+        .iter()
+        .map(|row| row[col].to_display_string())
+        .collect()
+}
+
+fn owned(values: &[&str]) -> Vec<String> {
+    values.iter().map(|s| (*s).to_string()).collect()
+}
+
 // ---- Ported scenarios ----------------------------------------------------------------------
 
 /// TCK: tck/features/useCases/triadicSelection/TriadicSelection1.feature
@@ -312,6 +328,55 @@ fn triadic_selection_1_not_a_friend() {
         0,
     );
     assert_eq!(got, sorted(&["b3", "c11", "c12", "c21", "c22"]));
+}
+
+/// TCK: tck/features/clauses/return-orderby/ReturnOrderBy1.feature
+/// Scenarios [1]-[6] — `UNWIND [...] AS x RETURN x ORDER BY x [DESC]` over homogeneous element
+/// types (booleans, strings, integers). Now portable because `UNWIND` can start a query.
+///
+/// Not ported: [7]/[8] (floats — unsupported) and [9]/[10] (lists mixing types and nulls — Cypher's
+/// cross-type orderability, with nulls sorting last, differs from this crate's comparator).
+#[test]
+fn return_order_by_1_homogeneous() {
+    let graph = Graph::default();
+
+    // (scenario, query, expected in order)
+    let cases: &[(&str, &str, Vec<String>)] = &[
+        (
+            "[1] booleans asc",
+            "UNWIND [true, false] AS bools RETURN bools ORDER BY bools",
+            owned(&["false", "true"]),
+        ),
+        (
+            "[2] booleans desc",
+            "UNWIND [true, false] AS bools RETURN bools ORDER BY bools DESC",
+            owned(&["true", "false"]),
+        ),
+        (
+            "[3] strings asc",
+            "UNWIND ['.*', '', ' ', 'one'] AS strings RETURN strings ORDER BY strings",
+            owned(&["", " ", ".*", "one"]),
+        ),
+        (
+            "[4] strings desc",
+            "UNWIND ['.*', '', ' ', 'one'] AS strings RETURN strings ORDER BY strings DESC",
+            owned(&["one", ".*", " ", ""]),
+        ),
+        (
+            "[5] ints asc",
+            "UNWIND [1, 3, 2] AS ints RETURN ints ORDER BY ints",
+            owned(&["1", "2", "3"]),
+        ),
+        (
+            "[6] ints desc",
+            "UNWIND [1, 3, 2] AS ints RETURN ints ORDER BY ints DESC",
+            owned(&["3", "2", "1"]),
+        ),
+    ];
+
+    for (scenario, query, expected) in cases {
+        assert_eq!(&column_in_order(&graph, query, 0), expected, "{scenario}");
+    }
 }
 
 /// TCK: tck/features/clauses/match/Match1.feature
