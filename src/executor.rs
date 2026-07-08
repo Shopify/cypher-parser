@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -109,6 +110,7 @@ pub fn execute<G: GraphProvider>(graph: &G, query: &Query) -> Result<ResultSet, 
         reverse_cache: RefCell::new(HashMap::new()),
         in_hoist: RefCell::new(HashMap::new()),
         pushdown: RefCell::new(HashMap::new()),
+        pushdown_active: Cell::new(false),
     };
     executor.run(query)
 }
@@ -123,16 +125,28 @@ struct Executor<'a, G: GraphProvider> {
     /// expression's address, so `x IN <constant list>` is an O(1) `HashSet` lookup instead of an
     /// O(list) scan re-evaluated per row. Populated for the duration of a single `filter_rows` pass.
     in_hoist: RefCell<HashMap<usize, Rc<HashSet<CypherValue>>>>,
-    /// Single-variable WHERE predicates pushed down into candidate generation, keyed by variable
-    /// name, so scans prune before pattern expansion. Set for the duration of a MATCH clause's
-    /// pattern expansion; the full WHERE is still applied afterwards.
+    /// Single-variable WHERE predicates from every non-optional MATCH clause, keyed by the variable
+    /// they reference, so a predicate prunes the scan/expansion that first binds its variable — even
+    /// when written on a later clause. Built once per query in `run`; the full WHERE is still applied
+    /// afterwards, so this is a safe pre-filter.
     pushdown: RefCell<HashMap<String, Vec<Expr>>>,
+    /// Gates pushdown application to non-optional MATCH pattern evaluation only. It must stay off
+    /// during `OPTIONAL MATCH` expansion and `EXISTS` subqueries: there, pruning a candidate that
+    /// fails a single-variable predicate can change results (e.g. an `OPTIONAL MATCH ... WHERE t IS
+    /// NULL` anti-join would null-fill every row and wrongly keep them all).
+    pushdown_active: Cell<bool>,
 }
 
 impl<G: GraphProvider> Executor<'_, G> {
     fn run(&self, query: &Query) -> Result<ResultSet, CypherError> {
         let mut rows: Vec<Row<G::NodeId>> = vec![Row::new()];
         let mut scope: Vec<String> = Vec::new();
+
+        // Build the pushdown map once from every non-optional MATCH's WHERE, so a single-variable
+        // predicate prunes the scan/expansion that first binds its variable even when the WHERE is
+        // written on a later clause. Without this, `MATCH (t)-[:R]->(c) MATCH (c)-..-(x) WHERE
+        // t.name = ...` materializes the entire `(t)-[:R]->(c)` relation before the `t` filter runs.
+        *self.pushdown.borrow_mut() = build_global_pushdown(&query.clauses);
 
         for clause in &query.clauses {
             match clause {
@@ -178,14 +192,16 @@ impl<G: GraphProvider> Executor<'_, G> {
             HashSet::new()
         };
 
-        // Push single-variable predicates down into candidate generation so scans prune before
-        // expansion. The full WHERE still runs afterwards, so this is a safe pre-filter.
-        *self.pushdown.borrow_mut() = build_pushdown(&clause.where_clause);
+        // Apply the (global) pushdown map only while evaluating this non-optional MATCH's patterns:
+        // scans prune before expansion, and the full WHERE still runs afterwards. Pushdown must stay
+        // off during `OPTIONAL MATCH` expansion and `EXISTS` (see `pushdown_active`), so it is gated
+        // rather than always-on.
+        self.pushdown_active.set(true);
         for pattern in &clause.patterns {
             rows = self.eval_pattern(rows, pattern)?;
             add_pattern_vars(scope, pattern);
         }
-        self.pushdown.borrow_mut().clear();
+        self.pushdown_active.set(false);
 
         if let Some(predicate) = &clause.where_clause {
             rows = self.filter_rows_hoisted(rows, predicate, &constant_vars)?;
@@ -197,6 +213,9 @@ impl<G: GraphProvider> Executor<'_, G> {
     /// variable. Best-effort: evaluation errors are ignored here (the full WHERE runs later and
     /// will surface them), so a node is only pruned when a pushed predicate is definitively false.
     fn node_passes_pushdown(&self, var: &Option<String>, node: G::NodeId) -> bool {
+        if !self.pushdown_active.get() {
+            return true;
+        }
         let Some(name) = var else {
             return true;
         };
@@ -1128,16 +1147,25 @@ fn resolve_order_column(
     )))
 }
 
-/// Builds the pushdown map: single-variable, aggregate/EXISTS-free `WHERE` conjuncts keyed by the
-/// variable they reference.
-fn build_pushdown(where_clause: &Option<Expr>) -> HashMap<String, Vec<Expr>> {
+/// Builds the pushdown map from every non-optional MATCH clause's `WHERE`: single-variable,
+/// aggregate/EXISTS-free conjuncts keyed by the variable they reference.
+///
+/// Only non-optional MATCH predicates are safe to push into candidate generation: they are inner
+/// selections, so pruning a candidate that fails a single-variable predicate can never drop a row
+/// the final WHERE would have kept. `OPTIONAL MATCH` (outer join) and `WITH ... WHERE` are skipped.
+fn build_global_pushdown(clauses: &[Clause]) -> HashMap<String, Vec<Expr>> {
     let mut map: HashMap<String, Vec<Expr>> = HashMap::new();
-    if let Some(predicate) = where_clause {
-        let mut conjuncts = Vec::new();
-        collect_conjuncts(predicate, &mut conjuncts);
-        for conjunct in conjuncts {
-            if let Some(var) = single_var(conjunct) {
-                map.entry(var).or_default().push(conjunct.clone());
+    for clause in clauses {
+        if let Clause::Match(m) = clause
+            && !m.optional
+            && let Some(predicate) = &m.where_clause
+        {
+            let mut conjuncts = Vec::new();
+            collect_conjuncts(predicate, &mut conjuncts);
+            for conjunct in conjuncts {
+                if let Some(var) = single_var(conjunct) {
+                    map.entry(var).or_default().push(conjunct.clone());
+                }
             }
         }
     }
